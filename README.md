@@ -13,7 +13,7 @@ An unofficial native Windows port of **Splatoon (Wii U)**, made by statically re
 - **Windows 10 or 11, 64-bit**
 - **GPU with Vulkan 1.3** and an up-to-date driver (developed on an RTX 5060 Ti; a modern NVIDIA or AMD GPU is recommended)
 - **CPU:** modern 6–8 cores or more · **RAM:** 16 GB minimum, 32 GB recommended (building the game uses a lot of memory)
-- **Disk:** about 40 GB free during setup
+- **Disk:** about 40 GB free during setup FINAL BUILD IS 6GB COUNTING THE SHADER CACHES
 - **Your own game dump:** Splatoon **EUR (AGMP01) with update v16**, with the folders `code`, `content` and `meta` (for example made with *Dumpling* on your Wii U). Other regions and versions are not supported yet.
 
 ## Installation (simple)
