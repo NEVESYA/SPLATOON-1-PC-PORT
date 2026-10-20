@@ -41,6 +41,8 @@ Setup.bat -GameDump "D:\My Wii U games\Splatoon [AGMP01]"
 
 ## Controls
 
+At launch, the game detects the display's desktop resolution and renders the TV scene at that GPU resolution, including its color/depth buffers and post-processing chain. It starts in borderless fullscreen; **F11** switches to a resizable window while retaining the selected internal resolution. Windows display scaling does not substitute a lower render resolution. The game's camera and UI retain their existing projection/layout.
+
 Controllers (Xbox, PlayStation or any SDL2 controller): buttons are mapped by position, like on the Wii U GamePad. The right stick controls the camera.
 
 The tutorial keeps its original camera behavior, controlled with the **right stick or mouse**. Outside the tutorial, including the plaza, the port applies **motion controls off** and **neutral camera sensitivity (0)** automatically. It saves only those two preferences and the updated checksum; progress, character data, camera inversion and other settings are preserved. The first edited save is backed up as `save.dat.before-control-defaults`. A new save is still created by the game normally.

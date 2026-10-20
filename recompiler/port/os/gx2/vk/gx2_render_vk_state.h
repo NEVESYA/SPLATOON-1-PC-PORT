@@ -4,6 +4,7 @@
 // Guest raster state is translated to Vulkan pipelines, descriptors and dynamic state.
 // Capture wire values remain stable for replay compatibility.
 #include "gx2_vk.h"
+#include "gx2_render_resolution.h"
 #include "../gx2_render.h"
 #include "../gx2_surface.h"
 #include "../gx2_detile.h"
@@ -83,6 +84,7 @@ struct TexObject {
     TexParams params;
     uint32_t id = 0;                     // stable diagnostic id ("gl tex")
     bool complete_storage = true;        // false: GPU would have no level 0
+    std::array<float, 2> coordinate_scale{1.0f, 1.0f}; // host texels / guest texels
 };
 
 struct ColorTarget {             // CBEntry
@@ -221,6 +223,7 @@ struct SamplerState { TexParams params; bool valid = false; };
 // Renderer globals (render thread only).
 // ---------------------------------------------------------------------------
 struct State {
+    VkExtent2D display_extent{1280, 720}; // physical desktop pixels, chosen before targets exist
     std::map<ColorImageKey, ColorTarget> cb_map;
     std::map<ColorImageKey, DepthTarget> depth_map;
     std::map<TextureKey, Texture> tex_map;
@@ -273,6 +276,12 @@ struct State {
     float sampler_max_anisotropy = 1.0f;
 };
 State& state();
+inline std::array<float, 2> framebuffer_coordinate_scale() {
+    const auto& fb = state().framebuffer;
+    for (auto* color : fb.colors) if (color) return image_coordinate_scale(color->image, color->width, color->height);
+    if (fb.depth) return image_coordinate_scale(fb.depth->image, fb.depth->width, fb.depth->height);
+    return {1.0f, 1.0f};
+}
 
 // Shared helpers implemented in gx2_render_vk.cpp
 ColorImageKey color_image_key(uint32_t addr, uint8_t* mem, const uint8_t* descriptor);

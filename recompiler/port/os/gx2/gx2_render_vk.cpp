@@ -330,6 +330,14 @@ void gx2r::upload_image_level(gx2vk::Image& image, uint32_t level, uint32_t firs
                               uint32_t width, uint32_t height, uint32_t depth, const uint8_t* data, size_t bytes,
                               VkImageAspectFlags aspect) {
     if (!image.image || !data || !bytes) return;
+    std::vector<uint8_t> resized;
+    const uint32_t native_width=std::max(1u,image.desc.width>>level), native_height=std::max(1u,image.desc.height>>level);
+    if (layers==1 && depth==1 && (width!=native_width || height!=native_height) && !gx2vk::format_is_compressed(image.desc.format)) {
+        const uint32_t bpp=gx2vk::format_block_bytes(image.desc.format,aspect?aspect:VK_IMAGE_ASPECT_COLOR_BIT);
+        if (!width || !height || !bpp || uint64_t(width)*height*bpp>bytes) return;
+        resized=resize_texels(data,width,height,native_width,native_height,bpp);
+        data=resized.data(); bytes=resized.size(); width=native_width; height=native_height;
+    }
     end_rendering();
     auto span = gx2vk::upload(bytes, 16);
     if (!span.data) {
@@ -379,6 +387,12 @@ void gx2r::clear_image_depth(gx2vk::Image& image, float depth, uint32_t stencil)
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
+bool gx2_render_set_display_resolution(uint32_t width, uint32_t height) {
+    if (!width || !height || !S.cb_map.empty() || !S.depth_map.empty()) return false;
+    if (gx2vk::ready() && (width > gx2vk::caps().limits.maxImageDimension2D || height > gx2vk::caps().limits.maxImageDimension2D)) return false;
+    S.display_extent = {width, height};
+    return true;
+}
 void gx2_render_init() {
     TXDIAG(++txdiag::journal().epoch;txdiag::event("renderer_init"));
     // gx2.rpl FUN_02007718 (GX2 initialization): viewport transform enabled,
@@ -408,11 +422,17 @@ void gx2_render_init() {
     S.raster.cull = true;
     S.raster.cull_face = wire::BACK;
     S.raster.front_face = wire::CCW;
-    // GPU's initial viewport is the default framebuffer: the window drawable.
+    // Select physical desktop pixels once, before creating any guest targets.
+    // Resizing a window must not silently change the scene's render resolution.
     if (auto* window = static_cast<SDL_Window*>(gx2_native_window())) {
-        int w = 0, h = 0;
-        SDL_Vulkan_GetDrawableSize(window, &w, &h);
-        S.raster.viewport[2] = w; S.raster.viewport[3] = h;
+        SDL_DisplayMode desktop{};
+        const int display = SDL_GetWindowDisplayIndex(window);
+        if (display < 0 || SDL_GetDesktopDisplayMode(display, &desktop) != 0 ||
+            !gx2_render_set_display_resolution(uint32_t(std::max(0, desktop.w)), uint32_t(std::max(0, desktop.h)))) {
+            RBREW_LOGF(stderr, "[gx2_render] cannot select the desktop's render resolution\n");
+            std::exit(3);
+        }
+        S.raster.viewport[2] = 1280; S.raster.viewport[3] = 720;
     }
     RBREW_LOGF(stderr, "[gx2_render] Vulkan rendering back-end initialised (%s)\n", gx2vk::caps().device_name.c_str());
 }
@@ -433,8 +453,8 @@ static void copy_depth_to_color_alias(DepthTarget& depth, ColorTarget& color) {
     const VkFormat df = depth.format, cf = color.image.desc.format;
     const uint32_t bpp = df == VK_FORMAT_D32_SFLOAT && cf == VK_FORMAT_R32_SFLOAT ? 4 :
                          df == VK_FORMAT_D16_UNORM && cf == VK_FORMAT_R16_UNORM ? 2 : 0;
-    if (!bpp || depth.width != color.image.desc.width || depth.height != color.image.desc.height) return;
-    const VkDeviceSize bytes = VkDeviceSize(depth.width) * depth.height * bpp;
+    if (!bpp || depth.image.desc.width != color.image.desc.width || depth.image.desc.height != color.image.desc.height) return;
+    const VkDeviceSize bytes = VkDeviceSize(depth.image.desc.width) * depth.image.desc.height * bpp;
     if (s_alias_staging.size < bytes) {
         if (s_alias_staging.buffer) gx2vk::destroy_buffer(s_alias_staging);
         s_alias_staging = gx2vk::create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -446,7 +466,7 @@ static void copy_depth_to_color_alias(DepthTarget& depth, ColorTarget& color) {
     gx2vk::barrier_if_dirty();
     VkBufferImageCopy region{};
     region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-    region.imageExtent = {depth.width, depth.height, 1};
+    region.imageExtent = {depth.image.desc.width, depth.image.desc.height, 1};
     vkCmdCopyImageToBuffer(cb, depth.image.image, VK_IMAGE_LAYOUT_GENERAL, s_alias_staging.buffer, 1, &region);
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -564,7 +584,10 @@ void gx2_render_set_color_buffer(uint32_t cb_addr, uint8_t* mem, const uint8_t* 
         e.id = S.next_object_id++;
         gx2vk::ImageDesc desc;
         desc.format = e.fmt.format;
-        desc.width = w; desc.height = h;
+        const uint32_t dim=descriptor_word(data,GX2SURF_DIM);
+        const auto extent = e.fmt.integer || e.fmt.compressed || (dim!=1 && dim!=6) ?
+            VkExtent2D{w,h} : screen_target_extent(w,h,S.display_extent);
+        desc.width = extent.width; desc.height = extent.height;
         desc.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         const bool renderable = !e.fmt.compressed && !e.fmt.depth && color_format_renderable(e.fmt.attachment);
         if (renderable) desc.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -583,6 +606,7 @@ void gx2_render_set_color_buffer(uint32_t cb_addr, uint8_t* mem, const uint8_t* 
         // A CBEntry is one selected mip/slice, stored at level zero: max level 0.
         e.tex.params = render_target_params(e.fmt.integer);
         e.tex.id = e.id;
+        e.tex.coordinate_scale = image_coordinate_scale(e.image, w, h);
         it = S.cb_map.emplace(key, std::move(e)).first;
         it->second.tex.image = &it->second.image;
         RBREW_LOGF(stderr, "[gx2_render] created FBO %u for CB 0x%08X (%ux%u fmt=0x%04X)\n", it->second.id, cb_addr, w, h, fmt);
@@ -618,7 +642,9 @@ void gx2_render_set_depth_buffer(uint32_t db_addr, uint8_t* mem, const uint8_t* 
         e.id = S.next_object_id++;
         gx2vk::ImageDesc desc;
         desc.format = e.format;
-        desc.width = e.width; desc.height = e.height;
+        const uint32_t dim=descriptor_word(data,GX2SURF_DIM);
+        const auto extent = dim==1 || dim==6 ? screen_target_extent(e.width,e.height,S.display_extent) : VkExtent2D{e.width,e.height};
+        desc.width = extent.width; desc.height = extent.height;
         desc.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (!gx2vk::create_image(e.image, desc)) { S.depth_map.erase(it); return; }
@@ -630,6 +656,7 @@ void gx2_render_set_depth_buffer(uint32_t db_addr, uint8_t* mem, const uint8_t* 
         // Each native depth view owns one selected mip; NEAREST, max level 0.
         e.tex.params = render_target_params(true);
         e.tex.id = e.id;
+        e.tex.coordinate_scale = image_coordinate_scale(e.image, e.width, e.height);
         RBREW_LOGF(stderr, "[gx2_render] created depth texture %u for image %08X (%ux%u fmt=%X)\n", e.id, key[0], e.width, e.height, key[1]);
         // The GPU back-end binds the new depth-only FBO while creating it; with
         // no color target bound it stays the current framebuffer (clears
@@ -695,11 +722,8 @@ static void clear_bound(bool color, bool depth, bool stencil) {
     rect.layerCount = 1;
     rect.rect = area;
     if (S.raster.scissor_test) {
-        const int32_t x0 = std::max(S.raster.scissor[0], 0), y0 = std::max(S.raster.scissor[1], 0);
-        const int32_t x1 = std::min<int32_t>(S.raster.scissor[0] + S.raster.scissor[2], int32_t(area.extent.width));
-        const int32_t y1 = std::min<int32_t>(S.raster.scissor[1] + S.raster.scissor[3], int32_t(area.extent.height));
-        if (x1 <= x0 || y1 <= y0) return;
-        rect.rect = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+        rect.rect = resolution_scissor(S.raster.scissor, area.extent, framebuffer_coordinate_scale());
+        if (!rect.rect.extent.width || !rect.rect.extent.height) return;
     }
     std::vector<VkClearAttachment> clears;
     if (color) {
@@ -1157,6 +1181,30 @@ template<class Target> static void live_copy_recorded(Texture& destination, cons
     destination.copied_sources[source.id] = source.image.content_generation;
 }
 
+// Array/volume aliases keep their guest layout. Resample a scaled 2D view
+// before the existing slice copy, rather than cropping its upper-left corner.
+static bool copy_color_view(ColorTarget& source, gx2vk::Image& destination, const VkImageCopy& region) {
+    gx2vk::Image resized;
+    auto* image=&source.image;
+    if(image->desc.width!=source.width || image->desc.height!=source.height) {
+        if(!gx2vk::format_supports(image->desc.format,VK_FORMAT_FEATURE_BLIT_SRC_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT)) return false;
+        gx2vk::ImageDesc desc;
+        desc.width=source.width; desc.height=source.height; desc.format=image->desc.format;
+        desc.usage=VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if(!gx2vk::create_image(resized,desc)) return false;
+        gx2vk::barrier_if_dirty();
+        VkImageBlit blit{};
+        blit.srcSubresource=blit.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
+        blit.srcOffsets[1]={int32_t(image->desc.width),int32_t(image->desc.height),1};
+        blit.dstOffsets[1]={int32_t(source.width),int32_t(source.height),1};
+        vkCmdBlitImage(gx2vk::cmd(),image->image,VK_IMAGE_LAYOUT_GENERAL,resized.image,VK_IMAGE_LAYOUT_GENERAL,1,&blit,VK_FILTER_NEAREST);
+        gx2vk::note_gpu_write(resized); gx2vk::barrier_if_dirty(); image=&resized;
+    }
+    vkCmdCopyImage(gx2vk::cmd(),image->image,VK_IMAGE_LAYOUT_GENERAL,destination.image,VK_IMAGE_LAYOUT_GENERAL,1,&region);
+    if(resized.image) gx2vk::destroy_image(resized); // deferred through the copy's completion serial
+    return true;
+}
+
 void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, const uint8_t* descriptor) {
     Gx2PerfScope perf_scope(kPerfTexture);
     if (!tex_addr || !gx2vk::ready() || slot >= S.bound_textures.size()) return;
@@ -1284,7 +1332,16 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
                 region.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
                 region.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, key[5], key[6] - first_slice, 1};
                 region.extent = {depth.width, depth.height, 1};
-                vkCmdCopyImage(cb, depth.image.image, VK_IMAGE_LAYOUT_GENERAL, entry.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                if(depth.image.desc.width==depth.width && depth.image.desc.height==depth.height) {
+                    vkCmdCopyImage(cb, depth.image.image, VK_IMAGE_LAYOUT_GENERAL, entry.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                } else {
+                    if(!gx2vk::format_supports(depth.format,VK_FORMAT_FEATURE_BLIT_SRC_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT)) return;
+                    VkImageBlit blit{};
+                    blit.srcSubresource=region.srcSubresource; blit.dstSubresource=region.dstSubresource;
+                    blit.srcOffsets[1]={int32_t(depth.image.desc.width),int32_t(depth.image.desc.height),1};
+                    blit.dstOffsets[1]={int32_t(depth.width),int32_t(depth.height),1};
+                    vkCmdBlitImage(cb,depth.image.image,VK_IMAGE_LAYOUT_GENERAL,entry.image.image,VK_IMAGE_LAYOUT_GENERAL,1,&blit,VK_FILTER_NEAREST);
+                }
                 live_copy_recorded(entry, depth);
                 if (g_trace_active || shadow_log())
                     RBREW_LOGF(stderr, "[tex] slot %u samples depth target slice %u image %08X (tex %u %ux%ux%u fmt %X mip %u)\n",
@@ -1350,6 +1407,7 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
                 view.tex.integer = gf.integer;
                 view.tex.params = render_target_params(gf.integer);
                 view.tex.params.max_level = 1000;   // glTextureView with one level
+                view.tex.coordinate_scale = cb.tex.coordinate_scale;
             }
             view.tex.swizzle = word4;
             bind_unit(slot, &view.tex);
@@ -1505,7 +1563,7 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
             region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, key[5], is3d ? 0u : key[6] - first_slice, 1};
             region.dstOffset = {0, 0, is3d ? int32_t(key[6] - first_slice) : 0};
             region.extent = {std::min(cb.width, std::max(1u, w >> key[5])), std::min(cb.height, std::max(1u, h >> key[5])), 1};
-            vkCmdCopyImage(cbuf, cb.image.image, VK_IMAGE_LAYOUT_GENERAL, entry.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            if(!copy_color_view(cb,entry.image,region)) continue;
             live_copy_recorded(entry, cb);
             copied = true;
             if (g_trace_active)
@@ -1647,7 +1705,10 @@ bool copy_cpu_surface(const uint8_t* src, uint32_t src_mip, uint32_t src_slice, 
         if (sd.is_depth || vf.depth || vf.compressed) return false;
         Gx2PerfScope readback(kPerfTexReadback);
         end_rendering();
-        if (!gx2vk::read_image(live->image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, live->width, live->height, linear)) return false;
+        const auto& image=live->image;
+        if (!gx2vk::read_image(live->image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, image.desc.width, image.desc.height, linear)) return false;
+        if(image.desc.width!=live->width || image.desc.height!=live->height)
+            linear=resize_texels(linear.data(),image.desc.width,image.desc.height,live->width,live->height,vf.bpp);
         if (linear.size() < bytes) return false;
         linear.resize(bytes);
     } else {
@@ -1748,23 +1809,27 @@ void gx2_render_copy_surface(const uint8_t* src, uint32_t src_mip, uint32_t src_
             gx2vk::barrier_if_dirty();
             const VkImageAspectFlags aspect = src_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
             const uint32_t src_w = std::max(1u, source_image->desc.width >> source_level), src_h = std::max(1u, source_image->desc.height >> source_level);
-            const uint32_t cw = std::min(width, std::min(src_w, target.desc.width)), ch = std::min(height, std::min(src_h, target.desc.height));
-            if (source_image->desc.format == target.desc.format || src_depth) {
-                if (source_image->desc.format == target.desc.format) {
-                    VkImageCopy region{};
-                    region.srcSubresource = {aspect, source_level, 0, 1};
-                    region.dstSubresource = {aspect, 0, 0, 1};
-                    region.extent = {cw, ch, 1};
-                    vkCmdCopyImage(cb, source_image->image, VK_IMAGE_LAYOUT_GENERAL, target.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-                }
-                // A depth blit between different formats fails in GPU too.
-            } else if (gx2vk::format_is_integer(source_image->desc.format) == gx2vk::format_is_integer(target.desc.format) &&
-                       !gx2vk::format_is_compressed(target.desc.format)) {
+            const uint32_t swidth=std::max(1u,sk[2]>>src_mip), sheight=std::max(1u,sk[3]>>src_mip);
+            const uint32_t dwidth=std::max(1u,dk[2]>>dst_mip), dheight=std::max(1u,dk[3]>>dst_mip);
+            const uint32_t cw=std::max(1u,uint32_t(uint64_t(width)*src_w/swidth)), ch=std::max(1u,uint32_t(uint64_t(height)*src_h/sheight));
+            const uint32_t dw=std::max(1u,uint32_t(uint64_t(width)*target.desc.width/dwidth)), dh=std::max(1u,uint32_t(uint64_t(height)*target.desc.height/dheight));
+            const bool same_format=source_image->desc.format==target.desc.format;
+            if (same_format && cw==dw && ch==dh) {
+                VkImageCopy region{};
+                region.srcSubresource = {aspect, source_level, 0, 1};
+                region.dstSubresource = {aspect, 0, 0, 1};
+                region.extent = {cw, ch, 1};
+                vkCmdCopyImage(cb, source_image->image, VK_IMAGE_LAYOUT_GENERAL, target.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            } else if ((!src_depth || same_format) &&
+                       gx2vk::format_is_integer(source_image->desc.format) == gx2vk::format_is_integer(target.desc.format) &&
+                       !gx2vk::format_is_compressed(target.desc.format) &&
+                       gx2vk::format_supports(source_image->desc.format,VK_FORMAT_FEATURE_BLIT_SRC_BIT) &&
+                       gx2vk::format_supports(target.desc.format,VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
                 VkImageBlit blit{};
                 blit.srcSubresource = {aspect, source_level, 0, 1};
                 blit.srcOffsets[1] = {int32_t(cw), int32_t(ch), 1};
                 blit.dstSubresource = {aspect, 0, 0, 1};
-                blit.dstOffsets[1] = {int32_t(cw), int32_t(ch), 1};
+                blit.dstOffsets[1] = {int32_t(dw), int32_t(dh), 1};
                 vkCmdBlitImage(cb, source_image->image, VK_IMAGE_LAYOUT_GENERAL, target.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
             }
             gx2vk::note_gpu_write(target);
@@ -1831,23 +1896,23 @@ void gx2_render_copy_to_scan(uint32_t cb_addr, uint32_t scan_target, uint8_t* me
         // into an SRGB image does the same; a raw copy keeps the encoded
         // bytes for the unconverted present blit.
         auto& encoded = s_encoded[gamepad];
-        if (!encoded.raw.image || encoded.width != scan.width || encoded.height != scan.height) {
+        if (!encoded.raw.image || encoded.width != scan.image.desc.width || encoded.height != scan.image.desc.height) {
             gx2vk::destroy_image(encoded.srgb); gx2vk::destroy_image(encoded.raw);
             gx2vk::ImageDesc desc;
-            desc.width = scan.width; desc.height = scan.height;
+            desc.width = scan.image.desc.width; desc.height = scan.image.desc.height;
             desc.format = VK_FORMAT_R8G8B8A8_SRGB;
             desc.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
             gx2vk::create_image(encoded.srgb, desc);
             desc.format = VK_FORMAT_R8G8B8A8_UNORM;
             gx2vk::create_image(encoded.raw, desc);
-            encoded.width = scan.width; encoded.height = scan.height;
+            encoded.width = scan.image.desc.width; encoded.height = scan.image.desc.height;
         }
         end_rendering();
         VkCommandBuffer cb = gx2vk::cmd();
         gx2vk::barrier_if_dirty();
         VkImageBlit blit{};
         blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        blit.srcOffsets[1] = {int32_t(scan.width), int32_t(scan.height), 1};
+        blit.srcOffsets[1] = {int32_t(scan.image.desc.width), int32_t(scan.image.desc.height), 1};
         blit.dstSubresource = blit.srcSubresource;
         blit.dstOffsets[1] = blit.srcOffsets[1];
         vkCmdBlitImage(cb, scan.image.image, VK_IMAGE_LAYOUT_GENERAL, encoded.srgb.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
@@ -1855,7 +1920,7 @@ void gx2_render_copy_to_scan(uint32_t cb_addr, uint32_t scan_target, uint8_t* me
         gx2vk::full_barrier();
         VkImageCopy copy{};
         copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.extent = {scan.width, scan.height, 1};
+        copy.extent = {scan.image.desc.width, scan.image.desc.height, 1};
         vkCmdCopyImage(cb, encoded.srgb.image, VK_IMAGE_LAYOUT_GENERAL, encoded.raw.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
         gx2vk::note_gpu_write(encoded.raw);
         image = &encoded.raw;
@@ -1863,7 +1928,7 @@ void gx2_render_copy_to_scan(uint32_t cb_addr, uint32_t scan_target, uint8_t* me
     const unsigned index = gamepad ? 1 : 0;
     S.scan_source[index] = &scan;
     S.scan_image[index] = image;
-    S.scan_w[index] = scan.width; S.scan_h[index] = scan.height;
+    S.scan_w[index] = scan.image.desc.width; S.scan_h[index] = scan.image.desc.height;
 }
 
 #ifndef RBREW_DISABLE_LOGGING

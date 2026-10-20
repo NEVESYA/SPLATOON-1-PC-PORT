@@ -112,6 +112,62 @@ uint32_t element_address(const Gx2DetileDesc& d, uint32_t x, uint32_t y) {
         x,y,d.slice,0,d.bits_per_element,d.pitch,height,1,mode,d.is_depth,
         (d.swizzle >> 8) & 1,(d.swizzle >> 9) & 3);
 }
+
+template<class F> bool with_addresses(const Gx2DetileDesc& d, F&& transfer) {
+    // Hoist invariant tile geometry, bank rotation and the 8x8 pixel-index
+    // table out of the texel loop. Small surfaces avoid the table setup cost.
+    if (d.tile_mode >= 4 && d.tile_mode <= 15 && uint64_t(d.width) * d.height >= 512) {
+        LatteAddrLib::CachedSurfaceAddrInfo info{};
+        LatteAddrLib::SetupCachedSurfaceAddrInfo(&info,d.slice,0,d.bits_per_element,d.pitch,
+            d.surface_height ? d.surface_height : d.height,1,1,
+            static_cast<Latte::E_HWTILEMODE>(d.tile_mode),d.is_depth,(d.swizzle >> 8) & 1,(d.swizzle >> 9) & 3);
+        // Both cached routines only read info. The shared stack table outlives
+        // all row bands; workers never mutate or retain it after pool.run().
+        if (d.tile_mode == 4)
+            return transfer([&](uint32_t x,uint32_t y) { return LatteAddrLib::ComputeSurfaceAddrFromCoordMacroTiledCached_tm04_sample1(x,y,&info); });
+        return transfer([&](uint32_t x,uint32_t y) { return LatteAddrLib::ComputeSurfaceAddrFromCoordMacroTiledCached(x,y,&info); });
+    }
+    return transfer([&](uint32_t x,uint32_t y) { return element_address(d,x,y); });
+}
+template<size_t Bytes> bool detile_elements(const Gx2DetileDesc& d,const uint8_t* tiled,size_t tiled_size,uint8_t* out) {
+    return with_addresses(d,[&](auto address_of) {
+        auto rows = [&](uint32_t y0,uint32_t y1) {
+            for(uint32_t y=y0;y<y1;++y) for(uint32_t x=0;x<d.width;++x) {
+                const uint32_t address=address_of(x,y);
+                if(uint64_t(address)+Bytes>tiled_size)return false;
+                // Constant-sized memcpy becomes an unaligned scalar/SIMD move,
+                // rather than a variable-sized library call for every texel.
+                std::memcpy(out+(size_t(y)*d.width+x)*Bytes,tiled+address,Bytes);
+            }
+            return true;
+        };
+        BandPool& pool=BandPool::get();
+        if(!pool.workers() || uint64_t(d.width)*d.height<kParallelElements || d.height<2)return rows(0,d.height);
+        const unsigned bands=std::min<unsigned>(d.height,(pool.workers()+1)*4);
+        std::atomic<bool> ok{true};
+        pool.run(bands,[&](unsigned band) {
+            const uint32_t y0=uint32_t(uint64_t(d.height)*band/bands),y1=uint32_t(uint64_t(d.height)*(band+1)/bands);
+            if(ok.load(std::memory_order_relaxed) && !rows(y0,y1))ok.store(false,std::memory_order_relaxed);
+        });
+        return ok.load();
+    });
+}
+template<size_t Bytes> bool retile_elements(const Gx2DetileDesc& d,const uint8_t* linear,uint8_t* tiled,size_t tiled_size) {
+    return with_addresses(d,[&](auto address_of) {
+        // Within an 8x8 microtile, bank/pipe/macro offsets are constant and
+        // (7,7) sets every intra-tile X/Y index bit. Its address bounds the
+        // whole block. Padding may extend beyond a valid partial allocation;
+        // in that case retain the exact logical-texel validation fallback.
+        bool blocks_fit=true;
+        for(uint64_t y=0;y<d.height && blocks_fit;y+=8)for(uint64_t x=0;x<d.width;x+=8)
+            if(uint64_t(address_of(uint32_t(x)|7,uint32_t(y)|7))+Bytes>tiled_size) {blocks_fit=false;break;}
+        if(!blocks_fit)for(uint32_t y=0;y<d.height;++y)for(uint32_t x=0;x<d.width;++x)
+            if(uint64_t(address_of(x,y))+Bytes>tiled_size)return false;
+        for(uint32_t y=0;y<d.height;++y)for(uint32_t x=0;x<d.width;++x)
+            std::memcpy(tiled+address_of(x,y),linear+(size_t(y)*d.width+x)*Bytes,Bytes);
+        return true;
+    });
+}
 }
 
 bool gx2_detile_mip0(const Gx2DetileDesc& d, const uint8_t* tiled, size_t tiled_size, uint8_t* out) {
@@ -128,28 +184,14 @@ bool gx2_detile_mip0(const Gx2DetileDesc& d, const uint8_t* tiled, size_t tiled_
             std::memcpy(out+size_t(y)*row,tiled+first+uint64_t(y)*pitch,size_t(row));
         return true;
     }
-    // On failure the caller discards `out` (header contract), so bands that
-    // already converted rows before another band failed change nothing.
-    auto rows = [&](uint32_t y0, uint32_t y1) {
-        for (uint32_t y = y0; y < y1; ++y) {
-            for (uint32_t x = 0; x < d.width; ++x) {
-                const uint32_t address = element_address(d,x,y);
-                if (uint64_t(address) + bytes > tiled_size) return false;
-                std::memcpy(out + (size_t(y) * d.width + x) * bytes, tiled + address, bytes);
-            }
-        }
-        return true;
-    };
-    BandPool& pool = BandPool::get();
-    if (!pool.workers() || uint64_t(d.width) * d.height < kParallelElements || d.height < 2)
-        return rows(0, d.height);
-    const unsigned bands = std::min<unsigned>(d.height, (pool.workers() + 1) * 4);
-    std::atomic<bool> ok{true};
-    pool.run(bands, [&](unsigned band) {
-        const uint32_t y0 = uint32_t(uint64_t(d.height) * band / bands), y1 = uint32_t(uint64_t(d.height) * (band + 1) / bands);
-        if (ok.load(std::memory_order_relaxed) && !rows(y0, y1)) ok.store(false, std::memory_order_relaxed);
-    });
-    return ok.load();
+    switch(bytes) {
+    case 1:return detile_elements<1>(d,tiled,tiled_size,out);
+    case 2:return detile_elements<2>(d,tiled,tiled_size,out);
+    case 4:return detile_elements<4>(d,tiled,tiled_size,out);
+    case 8:return detile_elements<8>(d,tiled,tiled_size,out);
+    case 16:return detile_elements<16>(d,tiled,tiled_size,out);
+    default:return false;
+    }
 }
 
 // Tests: change the helper count (0 = the serial loop).
@@ -170,9 +212,12 @@ bool gx2_retile_mip0(const Gx2DetileDesc& d, const uint8_t* linear,
             std::memcpy(tiled+first+uint64_t(y)*pitch,linear+size_t(y)*row,size_t(row));
         return true;
     }
-    for (uint32_t y=0;y<d.height;++y)for(uint32_t x=0;x<d.width;++x)
-        if (uint64_t(element_address(d,x,y))+bytes > tiled_size) return false;
-    for (uint32_t y=0;y<d.height;++y)for(uint32_t x=0;x<d.width;++x)
-        std::memcpy(tiled+element_address(d,x,y),linear+(size_t(y)*d.width+x)*bytes,bytes);
-    return true;
+    switch(bytes) {
+    case 1:return retile_elements<1>(d,linear,tiled,tiled_size);
+    case 2:return retile_elements<2>(d,linear,tiled,tiled_size);
+    case 4:return retile_elements<4>(d,linear,tiled,tiled_size);
+    case 8:return retile_elements<8>(d,linear,tiled,tiled_size);
+    case 16:return retile_elements<16>(d,linear,tiled,tiled_size);
+    default:return false;
+    }
 }

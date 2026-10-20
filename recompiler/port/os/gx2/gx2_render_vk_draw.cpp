@@ -267,9 +267,9 @@ bool gx2r::ensure_rendering(bool streamout_only) {
         if (!t) continue;
         // Incomplete framebuffer (non-renderable format): GPU draws nothing.
         if (!(t->image.desc.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return false;
-        w = std::min(w, t->width); h = std::min(h, t->height);
+        w = std::min(w, t->image.desc.width); h = std::min(h, t->image.desc.height);
     }
-    if (fb.depth) { w = std::min(w, fb.depth->width); h = std::min(h, fb.depth->height); }
+    if (fb.depth) { w = std::min(w, fb.depth->image.desc.width); h = std::min(h, fb.depth->image.desc.height); }
     if(w==UINT32_MAX && streamout_only)w=h=1; // GPU update has no raster attachments
     if (w == UINT32_MAX || !w || !h) return false;
     VkCommandBuffer cb = gx2vk::cmd();
@@ -2636,6 +2636,8 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
     d.write_count = d.buffer_count = d.image_count = 0;
     const VkDeviceSize ubo_align = std::max<VkDeviceSize>(gx2vk::caps().limits.minUniformBufferOffsetAlignment, 16);
     for (unsigned slot = 0; slot < 18; ++slot) gx2_render_set_sampler_comparison((stage == 0 ? 32 : 0) + slot, info.texture_compare[slot]);
+    // Resolve aliases before packing the texture-coordinate scale uniforms.
+    for (unsigned t=0;t<18;++t) if(vk.texture_bindings[t]>=0) refresh_bound_render_texture((stage==0?32:0)+t,mem);
     // Uniform-variable block (uniforms that GPU keeps on the program).
     if (vk.uniform_vars_binding >= 0) {
         auto& block = prog.ufblock_scratch[stage];
@@ -2679,17 +2681,20 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
             const float t[2] = {xs != 0.0f ? 1.0f / xs : 0.0f, ys != 0.0f ? -1.0f / ys : 0.0f};
             put(vk.offset_window_to_clip, t, 8);
         }
-        // Native framebuffer coordinates keep console size; both back-ends
-        // write uf_fragCoordScale = (1,1).
-        if (vk.offset_frag_coord_scale >= 0) { const float s[4] = {1, 1, 0, 0}; put(vk.offset_frag_coord_scale, s, 16); }
+        // Guest screen-space calculations still use console coordinates.
+        const auto framebuffer_scale = framebuffer_coordinate_scale();
+        if (vk.offset_frag_coord_scale >= 0) {
+            const float s[4] = {1.0f/framebuffer_scale[0], 1.0f/framebuffer_scale[1], 0, 0};
+            put(vk.offset_frag_coord_scale, s, 16);
+        }
         // Texel-coordinate fetches (guest SAMPLE with unnormalized coordinates
         // or LD) multiply the guest's raw texel coordinates by this scale.
-        // Without a texture-pack replacement the bound texture keeps the
-        // console resolution, so the factor is 1:1 (Cemu's
-        // LatteTexture_getEffectiveTextureScale; the GPU back-end binds the
-        // same value). A zero factor collapses every such fetch onto texel 0,0.
-        for (unsigned t = 0; t < 18; ++t)
-            if (vk.offset_tex_scale[t] >= 0) { const float scale[2] = {1, 1}; put(vk.offset_tex_scale[t], scale, 8); }
+        for (unsigned t = 0; t < 18; ++t) if (vk.offset_tex_scale[t] >= 0) {
+            const auto dim=vk.texture_dim[t];
+            const auto* tex = dim==0 || dim==1 ? nullptr : S.units[(stage==0?32:0)+t][dim==3?1:dim==5?2:dim==4?3:0];
+            const auto scale = tex ? tex->coordinate_scale : std::array<float,2>{1,1};
+            put(vk.offset_tex_scale[t], scale.data(), 8);
+        }
         auto& cached = prog.ufblock_cache[stage];
         auto& span = prog.ufblock_span[stage];
         const bool changed=cached!=block;
@@ -2777,7 +2782,6 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
         const uint32_t unit = (stage == 0 ? 32 : 0) + t;
         const uint32_t dim = vk.texture_dim[t];
         const bool integer = vk.texture_integer[t], shadow = vk.texture_shadow[t];
-        refresh_bound_render_texture(unit, mem);
         const uint32_t target_index = dim == 3 ? 1 : dim == 5 ? 2 : dim == 4 ? 3 : 0;
         TexObject* tex = dim == 1 || dim == 0 ? nullptr : S.units[unit][target_index];
 #ifdef RBREW_TEXTURE_DIAGNOSTICS
@@ -2890,18 +2894,13 @@ bool apply_dynamic_state(VkCommandBuffer cb, VkPrimitiveTopology topology, bool 
     // Viewport: GPU UPPER_LEFT (guest top at row 0) = negative-height Vulkan
     // viewport; LOWER_LEFT (guest h < 0) = positive height.
     if (g.viewport[2] <= 0 || g.viewport[3] <= 0) return false;
-    VkViewport vp{};
-    if (g.clip_origin == wire::UPPER_LEFT) { vp.x = float(g.viewport[0]); vp.y = float(g.viewport[1] + g.viewport[3]); vp.width = float(g.viewport[2]); vp.height = -float(g.viewport[3]); }
-    else { vp.x = float(g.viewport[0]); vp.y = float(g.viewport[1]); vp.width = float(g.viewport[2]); vp.height = float(g.viewport[3]); }
-    vp.minDepth = float(g.depth_range[0]); vp.maxDepth = float(g.depth_range[1]);
+    const auto scale = framebuffer_coordinate_scale();
+    const VkViewport vp = resolution_viewport(g.viewport, g.clip_origin == wire::UPPER_LEFT, g.depth_range, scale);
     if (!s_dyn.viewport_valid || std::memcmp(&vp, &s_dyn.viewport, sizeof(vp)) != 0) { vkCmdSetViewport(cb, 0, 1, &vp); s_dyn.viewport = vp; s_dyn.viewport_valid = true; }
     VkRect2D sc = area;
     if (g.scissor_test) {
-        const int32_t x0 = std::max(g.scissor[0], 0), y0 = std::max(g.scissor[1], 0);
-        const int32_t x1 = std::min<int32_t>(g.scissor[0] + g.scissor[2], int32_t(area.extent.width));
-        const int32_t y1 = std::min<int32_t>(g.scissor[1] + g.scissor[3], int32_t(area.extent.height));
-        if (x1 <= x0 || y1 <= y0) return false;   // empty scissor box: nothing rasterizes
-        sc = {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+        sc = resolution_scissor(g.scissor, area.extent, scale);
+        if (!sc.extent.width || !sc.extent.height) return false;
     }
     if (!s_dyn.scissor_valid || std::memcmp(&sc, &s_dyn.scissor, sizeof(sc)) != 0) { vkCmdSetScissor(cb, 0, 1, &sc); s_dyn.scissor = sc; s_dyn.scissor_valid = true; }
     const VkCullModeFlags cull = !g.cull ? VK_CULL_MODE_NONE : g.cull_face == wire::FRONT ? VK_CULL_MODE_FRONT_BIT :
@@ -3718,7 +3717,8 @@ VkPipelineLayout s_transfer_layout = VK_NULL_HANDLE;
 std::map<VkFormat, VkPipeline> s_transfer_pipelines;
 const char* kTransferVs = "#version 450\nvoid main(){vec2 p=vec2((gl_VertexIndex<<1)&2,gl_VertexIndex&2);gl_Position=vec4(p*2-1,0,1);}\n";
 const char* kTransferPs = "#version 450\nlayout(set=0,binding=0) uniform sampler2D source;layout(location=0) out vec4 value;"
-                          "void main(){value=vec4(texelFetch(source,ivec2(gl_FragCoord.xy),0).r,0,0,1);}\n";
+                          "layout(push_constant)uniform CopyScale{vec2 scale;}pc;"
+                          "void main(){value=vec4(texelFetch(source,ivec2(gl_FragCoord.xy*pc.scale),0).r,0,0,1);}\n";
 }
 
 bool gx2r::depth_to_color_pass(DepthTarget& source, ColorTarget& destination, uint32_t width, uint32_t height) {
@@ -3731,6 +3731,8 @@ bool gx2r::depth_to_color_pass(DepthTarget& source, ColorTarget& destination, ui
         vkCreateDescriptorSetLayout(gx2vk::device(), &set, nullptr, &s_transfer_set);
         VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout.setLayoutCount = 1; layout.pSetLayouts = &s_transfer_set;
+        const VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT,0,8};
+        layout.pushConstantRangeCount=1; layout.pPushConstantRanges=&push;
         vkCreatePipelineLayout(gx2vk::device(), &layout, nullptr, &s_transfer_layout);
     }
     const VkFormat format = destination.fmt.attachment;
@@ -3778,13 +3780,19 @@ bool gx2r::depth_to_color_pass(DepthTarget& source, ColorTarget& destination, ui
     color.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    info.renderArea = {{0, 0}, {destination.width, destination.height}};
+    info.renderArea = {{0, 0}, {destination.image.desc.width, destination.image.desc.height}};
     info.layerCount = 1; info.colorAttachmentCount = 1; info.pColorAttachments = &color;
     vkCmdBeginRendering(cb, &info);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    const VkViewport vp{0, 0, float(width), float(height), 0, 1};
-    const VkRect2D sc{{0, 0}, {std::min(width, destination.width), std::min(height, destination.height)}};
+    const auto dst_scale=image_coordinate_scale(destination.image,destination.width,destination.height);
+    const auto src_scale=image_coordinate_scale(source.image,source.width,source.height);
+    const uint32_t native_width=std::min(destination.image.desc.width,uint32_t(std::ceil(width*dst_scale[0])));
+    const uint32_t native_height=std::min(destination.image.desc.height,uint32_t(std::ceil(height*dst_scale[1])));
+    const VkViewport vp{0, 0, float(native_width), float(native_height), 0, 1};
+    const VkRect2D sc{{0, 0}, {native_width,native_height}};
     vkCmdSetViewport(cb, 0, 1, &vp); vkCmdSetScissor(cb, 0, 1, &sc);
+    const float copy_scale[2]={src_scale[0]/dst_scale[0],src_scale[1]/dst_scale[1]};
+    vkCmdPushConstants(cb,s_transfer_layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,8,copy_scale);
     gx2vk::ViewDesc sv; sv.type = VK_IMAGE_VIEW_TYPE_2D; sv.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
     TexParams nearest; nearest.min_filter = nearest.mag_filter = wire::NEAREST; nearest.max_level = 0;
     VkDescriptorImageInfo image{tex_object_sampler(nearest, false, false), gx2vk::image_view(source.image, sv), VK_IMAGE_LAYOUT_GENERAL};
@@ -3846,9 +3854,16 @@ std::shared_future<void> gx2_render_vk_test_background_compile(std::function<voi
 // Window close: wait (bounded) for queued translation-cache files, so translations
 // made this session are not lost when the process ends without destructors.
 void gx2_render_wait_cache_writes(uint32_t timeout_ms) {
-    auto& writer = translation_writer();
-    std::unique_lock lock(writer.mutex);
-    writer.idle.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return writer.queue.empty() && !writer.writing; });
+    {
+        auto& writer = translation_writer();
+        std::unique_lock lock(writer.mutex);
+        writer.idle.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return writer.queue.empty() && !writer.writing; });
+    }
+    // Window close ends the process without shader_shutdown()/destructors.
+    // Persist the driver cache here as well, otherwise every normal launch
+    // rebuilds those pipelines despite the warm-up manifest and SPIR-V cache.
+    // This is CPU-side cache export only: no GPU idle or compiler-worker join.
+    try { gx2vk::shader_cache_flush(); } catch (...) { /* optional cache, closing still succeeds */ }
 }
 uint32_t gx2_render_vk_last_program() { return s_last_program; }
 uint64_t gx2_render_vk_submitted_primitives() { return s_submitted_primitives; }

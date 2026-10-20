@@ -11,6 +11,8 @@
 
 // Create the Vulkan device and swapchain after the SDL window exists.
 void gx2_render_init();
+// Startup only: reject a change after guest targets exist, avoiding mixed sizes.
+bool gx2_render_set_display_resolution(uint32_t width, uint32_t height);
 // Show the loading splash and warm shader caches on the render thread.
 void gx2_render_startup();
 // Vulkan back-end: waits for the GPU and releases the device (GX2Shutdown).

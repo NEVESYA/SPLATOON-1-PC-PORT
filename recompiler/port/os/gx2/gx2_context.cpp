@@ -144,6 +144,7 @@ static bool gx2_platform_open_window() {
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
     // Keep reading the controller while another window has focus.
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         RBREW_LOGF(stderr, "[gx2] SDL_Init failed: %s\n", SDL_GetError());
         return false;
@@ -151,9 +152,12 @@ static bool gx2_platform_open_window() {
     // Vulkan presentation: no GPU attributes or context. The device and
     // swapchain are created by gx2_render_init for this window; the present
     // mode avoids a second refresh wait (see gx2_vk.cpp create_swapchain).
+    SDL_DisplayMode desktop{};
+    if (SDL_GetDesktopDisplayMode(0, &desktop) != 0 || desktop.w <= 0 || desktop.h <= 0) return false;
     s_window = SDL_CreateWindow("Splatoon | Vulkan | TV",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        1920, 1080, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+        desktop.w, desktop.h, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
+        SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_FULLSCREEN_DESKTOP);
     if (!s_window) {
         RBREW_LOGF(stderr, "[gx2] SDL_CreateWindow(SDL_WINDOW_VULKAN) failed: %s\n", SDL_GetError());
         return false;
