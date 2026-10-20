@@ -12,7 +12,6 @@ param(
     [string]$GameDump,      # folder with code\, content\, meta\ from your Wii U dump
     [string]$Mlc,           # optional local system-resource source; never prompts
     [string]$Output,        # where the playable game folder is created
-    [switch]$SkipShaders,   # do not download the prebuilt shader cache
     [switch]$Clean          # delete previous build outputs first
 )
 
@@ -32,12 +31,6 @@ $Downloads = Join-Path $Work 'downloads'
 $SupportedRpxSha256 = '45ECD1ED81A97F46B1C8AE24820CD47FBC55399B50AF09BF1F9050FE803308E5'
 $BoundaryProfile = Join-Path $Root 'profiles\agmp-v16.entries'
 $MinimumFunctionCount = 96300
-
-# Prebuilt shader cache (vulkan_cache.zip) hosted on MEGA.
-$ShaderMegaHandle = '6h4CGLJa'
-$ShaderMegaKey = 'biEveJ_5lnR0UMdC4u-4KaMGKseyDrHgkUuj3BCwLgQ'
-$ShaderZipSha256 = '0D9BB84178AB23F25A1884ADE4B461D57EA7B2C07CB8CF3208179A2776731736'
-$ShaderZipSize = 856805907
 
 # Open-source build dependencies (official upstream releases).
 $SdlUrl = 'https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-2.32.10.zip'
@@ -62,7 +55,7 @@ $script:StepNumber = 0
 function Step([string]$Text) {
     $script:StepNumber++
     Write-Host ''
-    Write-Host ("[{0}/9] {1}" -f $script:StepNumber, $Text) -ForegroundColor Cyan
+    Write-Host ("[{0}/8] {1}" -f $script:StepNumber, $Text) -ForegroundColor Cyan
 }
 function Info([string]$Text) { Write-Host "      $Text" }
 function Good([string]$Text) { Write-Host "      $Text" -ForegroundColor Green }
@@ -261,94 +254,6 @@ function Prepare-WiiUResources([string]$Dump, [string]$Destination, [string]$Sou
         Warn 'No local Mii graphics resources found; some Mii graphics may be unavailable.'
     }
     Good 'Wii U folders initialized automatically; no saves or accounts imported.'
-}
-
-# MEGA public links carry their AES key after '#': the file is AES-128-CTR
-# encrypted. This helper downloads and decrypts in one streaming pass.
-$MegaSource = @'
-using System;
-using System.IO;
-using System.Net;
-using System.Security.Cryptography;
-
-public static class MegaDownload {
-    static byte[] FromBase64Url(string s) {
-        s = s.Replace('-', '+').Replace('_', '/');
-        while (s.Length % 4 != 0) s += "=";
-        return Convert.FromBase64String(s);
-    }
-    public static void Keys(string linkKey, out byte[] aesKey, out byte[] nonce) {
-        byte[] k = FromBase64Url(linkKey);
-        if (k.Length != 32) throw new Exception("Unexpected MEGA key length");
-        aesKey = new byte[16];
-        for (int i = 0; i < 16; i++) aesKey[i] = (byte)(k[i] ^ k[i + 16]);
-        nonce = new byte[8];
-        Array.Copy(k, 16, nonce, 0, 8);
-    }
-    public static void Fetch(string url, string linkKey, string destination, long expectedSize) {
-        byte[] aesKey, nonce;
-        Keys(linkKey, out aesKey, out nonce);
-        using (Aes aes = Aes.Create()) {
-            aes.Mode = CipherMode.ECB;
-            aes.Padding = PaddingMode.None;
-            aes.Key = aesKey;
-            using (ICryptoTransform ecb = aes.CreateEncryptor()) {
-                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(url);
-                request.Timeout = 60000;
-                request.ReadWriteTimeout = 120000;
-                using (WebResponse response = request.GetResponse())
-                using (Stream input = response.GetResponseStream())
-                using (FileStream output = new FileStream(destination, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20)) {
-                    const int Chunk = 1 << 20;   // multiple of 16
-                    byte[] data = new byte[Chunk];
-                    byte[] counters = new byte[Chunk];
-                    byte[] stream = new byte[Chunk];
-                    long block = 0, total = 0;
-                    int lastPercent = -1;
-                    while (true) {
-                        int filled = 0;
-                        while (filled < Chunk) {
-                            int n = input.Read(data, filled, Chunk - filled);
-                            if (n <= 0) break;
-                            filled += n;
-                        }
-                        if (filled == 0) break;
-                        int blocks = (filled + 15) / 16;
-                        for (int b = 0; b < blocks; b++) {
-                            int o = b * 16;
-                            Array.Copy(nonce, 0, counters, o, 8);
-                            long c = block + b;
-                            for (int i = 0; i < 8; i++) counters[o + 15 - i] = (byte)(c >> (8 * i));
-                        }
-                        ecb.TransformBlock(counters, 0, blocks * 16, stream, 0);
-                        for (int i = 0; i < filled; i++) data[i] ^= stream[i];
-                        output.Write(data, 0, filled);
-                        block += blocks;
-                        total += filled;
-                        if (expectedSize > 0) {
-                            int percent = (int)(total * 100 / expectedSize);
-                            if (percent != lastPercent && percent % 5 == 0) {
-                                Console.WriteLine("      " + percent + "%  (" + (total >> 20) + " / " + (expectedSize >> 20) + " MB)");
-                                lastPercent = percent;
-                            }
-                        }
-                        if (filled < Chunk) break;
-                    }
-                }
-            }
-        }
-    }
-}
-'@
-
-function Get-MegaFile([string]$Handle, [string]$LinkKey, [string]$Destination, [long]$ExpectedSize) {
-    if (-not ('MegaDownload' -as [type])) { Add-Type -TypeDefinition $MegaSource -Language CSharp }
-    $body = '[{"a":"g","g":1,"p":"' + $Handle + '"}]'
-    $reply = Invoke-RestMethod -Method Post -Uri ("https://g.api.mega.co.nz/cs?id=" + (Get-Random)) -Body $body -ContentType 'application/json'
-    if ($reply -is [int] -or -not $reply[0].g) { Fail "MEGA refused the shader download (reply: $reply). The link may be over its quota; try again later." }
-    $partial = "$Destination.part"
-    [MegaDownload]::Fetch($reply[0].g, $LinkKey, $partial, $ExpectedSize)
-    Move-Item -LiteralPath $partial -Destination $Destination -Force
 }
 
 # ---------------------------------------------------------------------------
@@ -551,32 +456,6 @@ Copy-Tree (Join-Path $GameDump 'content') (Join-Path $Output 'content')
 Copy-Tree (Join-Path $GameDump 'meta') (Join-Path $Output 'meta')
 Good 'Wii U folders ready. No existing game or Mii saves were imported.'
 Good 'A new installation starts fresh; progress already in this output folder is kept on updates.'
-
-# ---------------------------------------------------------------------------
-Step 'Downloading the prebuilt shader cache (about 820 MB, unpacks to about 4.5 GB)'
-$cacheDir = Join-Path $Output 'vulkan_cache'
-if ($SkipShaders) {
-    Warn 'Skipped (-SkipShaders). The game will build shaders while you play, with more stutter at first.'
-} elseif (Test-Path -LiteralPath (Join-Path $cacheDir 'spirv') -PathType Container) {
-    Good 'Shader cache already installed; keeping it.'
-} else {
-    $zip = Join-Path $Downloads 'vulkan_cache.zip'
-    if ((Test-Path -LiteralPath $zip) -and ((Get-Item -LiteralPath $zip).Length -ne $ShaderZipSize)) { Remove-Item -LiteralPath $zip -Force }
-    if (-not (Test-Path -LiteralPath $zip)) {
-        Info 'Downloading from MEGA ...'
-        Get-MegaFile $ShaderMegaHandle $ShaderMegaKey $zip $ShaderZipSize
-    }
-    Info 'Verifying the download ...'
-    if ((File-Sha256 $zip) -ne $ShaderZipSha256) {
-        Remove-Item -LiteralPath $zip -Force
-        Fail 'The shader download is damaged. Run Setup.bat again to retry.'
-    }
-    Info 'Unpacking (this can take a few minutes) ...'
-    & tar.exe -xf $zip -C $Output
-    Check-Exit 'Unpacking the shader cache'
-    if (-not (Test-Path -LiteralPath (Join-Path $cacheDir 'spirv') -PathType Container)) { Fail 'The shader cache did not unpack into vulkan_cache.' }
-    Good 'Shader cache installed.'
-}
 
 # ---------------------------------------------------------------------------
 Write-Host ''

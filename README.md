@@ -22,7 +22,7 @@ An unofficial native Windows port of **Splatoon (Wii U)**, made by statically re
 2. Double-click **`Setup.bat`**.
    - If Visual Studio Build Tools, Python 3.12 or Git are missing, the setup offers to install them for you. Afterwards, close the window and run `Setup.bat` again.
 3. When asked, select your **Splatoon dump folder** (the one containing `code`, `content` and `meta`). **The dump folder can have any name**; spaces and brackets such as `Splatoon [AGMP01]` are supported. Select the parent folder, rather than `code` or `content` inside it. Setup creates the Wii U folders automatically; there is no system-folder selection.
-4. Wait. The first setup takes **30–90 minutes**: it builds the tools, recompiles your game and downloads the shader cache (about 820 MB).
+4. Wait. The first setup takes **30–90 minutes**: it builds the tools and recompiles your game.
 5. Play: **`Game\Splatoon.exe`** (the setup can also create a desktop shortcut).
 
 Setup creates the Wii U `mlc01` directory layout and the port's empty save folders automatically, like Cemu's initial setup. It uses existing local system fonts when available, or downloads Cemu's open-source Noto replacement fonts automatically (about 26 MB, with pinned checksums and their SIL OFL license). It never imports game saves, Mii save databases or console accounts. A fresh installation starts with no progress, and the game creates its save while you play.
@@ -31,7 +31,7 @@ Existing Mii graphics resources are detected automatically beside your game dump
 
 **Updating:** download the new version, then run `Setup.bat` again. Your save (`Game\save`) and shader cache are kept.
 
-Options: `Setup.bat -SkipShaders` skips the shader download, `-Clean` rebuilds everything, and `-Output D:\Splatoon` picks a different game folder.
+Options: `Setup.bat -Clean` rebuilds everything, and `-Output D:\Splatoon` picks a different game folder.
 
 You can also pass folders directly, with quotes around paths that contain spaces:
 
@@ -72,8 +72,6 @@ This project follows the same approach as other recompilation and decompilation 
 
 Do not share your game files or the generated `build` folder. This explanation is not legal advice, and laws differ between countries. Only use games you legally own.
 
-The optional shader cache download only speeds up the first play. It is hosted separately from this repository, and you can skip it with `-SkipShaders`; the game then builds its own.
-
 ## How the port works
 
 1. **Static recompilation (RebrewU).** The recompiler loads `Gambit.rpx`, the game's PowerPC executable. It discovers functions using the RPX and the supported version's checked boundary-address profile in `profiles/`, builds control-flow graphs, and translates PowerPC instructions into equivalent C++. The profile contains addresses, not game code. Setup checks that the supported function table is complete before building. The result is about 200 C++ files that the Microsoft C++ compiler builds into a native x64 program. No emulator CPU runs at play time.
@@ -85,7 +83,7 @@ The optional shader cache download only speeds up the first play. It is hosted s
    - texture, vertex, index and uniform caches that use OS write tracking instead of re-hashing every frame;
    - shader-key memoisation;
    - fixes for stale vertex layouts after level changes, 17-input vertex shaders, instance step rates, and out-of-bounds packed vertex attributes.
-5. **Shader cache.** `Game\vulkan_cache` stores translated shaders so they don't have to be rebuilt during play.
+5. **Shader cache.** The game builds `Game\vulkan_cache` locally as you play and reuses it on later launches. First-time shader compilation may cause stutter.
 
 ## Credits and licenses
 
