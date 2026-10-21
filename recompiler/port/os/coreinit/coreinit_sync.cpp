@@ -17,6 +17,30 @@
 #include <thread>
 #include <atomic>
 #include <cstdio>
+#include <array>
+#include <memory>
+
+// Objects have process lifetime and are never replaced or erased. Cache their
+// stable addresses per host thread; each object's mutex/CV still enforces guest
+// synchronization. Misses retain the registry lock for concurrent initialization.
+template<class T> static T* sync_object(uint32_t address, std::mutex& registry_lock,
+                                       std::unordered_map<uint32_t,T*>& registry) {
+    struct Entry { uint32_t address = 0; T* object = nullptr; };
+    thread_local std::array<Entry,64> recent{};
+    auto& entry=recent[((address>>2)^(address>>10))&(recent.size()-1)];
+    if(entry.object && entry.address==address)return entry.object;
+    std::lock_guard lock(registry_lock);
+    auto it=registry.find(address);
+    T* object;
+    if(it!=registry.end())object=it->second;
+    else {
+        auto owned=std::make_unique<T>();
+        registry.emplace(address,owned.get());
+        object=owned.release();
+    }
+    entry={address,object};
+    return object;
+}
 
 // ---------------------------------------------------------------------------
 // OSMutex — per-address recursive mutex
@@ -30,12 +54,7 @@ static std::mutex                                  s_mutex_map_lock;
 static std::unordered_map<uint32_t, MutexImpl*>   s_mutexes;
 
 static MutexImpl* get_mutex(uint32_t ptr) {
-    std::lock_guard<std::mutex> lk(s_mutex_map_lock);
-    auto it = s_mutexes.find(ptr);
-    if (it != s_mutexes.end()) return it->second;
-    auto* m = new MutexImpl();
-    s_mutexes[ptr] = m;
-    return m;
+    return sync_object(ptr,s_mutex_map_lock,s_mutexes);
 }
 
 static void OSInitMutex(CPUState* cpu)    { get_mutex(ARG0); }
@@ -64,12 +83,7 @@ static std::mutex                                 s_cond_map_lock;
 static std::unordered_map<uint32_t, CondImpl*>   s_condvars;
 
 static CondImpl* get_cond(uint32_t ptr) {
-    std::lock_guard<std::mutex> lk(s_cond_map_lock);
-    auto it = s_condvars.find(ptr);
-    if (it != s_condvars.end()) return it->second;
-    auto* cv = new CondImpl();
-    s_condvars[ptr] = cv;
-    return cv;
+    return sync_object(ptr,s_cond_map_lock,s_condvars);
 }
 
 static void OSInitCond(CPUState* cpu)  { get_cond(ARG0); }
@@ -116,12 +130,7 @@ static std::mutex                                s_sem_map_lock;
 static std::unordered_map<uint32_t, SemImpl*>   s_semaphores;
 
 static SemImpl* get_sem(uint32_t ptr) {
-    std::lock_guard<std::mutex> lk(s_sem_map_lock);
-    auto it = s_semaphores.find(ptr);
-    if (it != s_semaphores.end()) return it->second;
-    auto* s = new SemImpl();
-    s_semaphores[ptr] = s;
-    return s;
+    return sync_object(ptr,s_sem_map_lock,s_semaphores);
 }
 
 // OSInitSemaphore(sem, count)
@@ -162,12 +171,7 @@ static std::mutex                                  s_event_map_lock;
 static std::unordered_map<uint32_t, EventImpl*>   s_events;
 
 static EventImpl* get_event(uint32_t ptr) {
-    std::lock_guard<std::mutex> lk(s_event_map_lock);
-    auto it = s_events.find(ptr);
-    if (it != s_events.end()) return it->second;
-    auto* e = new EventImpl();
-    s_events[ptr] = e;
-    return e;
+    return sync_object(ptr,s_event_map_lock,s_events);
 }
 
 // OSInitEvent(event, initialState, mode)

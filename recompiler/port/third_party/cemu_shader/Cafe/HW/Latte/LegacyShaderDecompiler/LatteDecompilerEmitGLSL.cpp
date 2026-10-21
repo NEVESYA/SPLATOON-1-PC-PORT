@@ -3872,7 +3872,9 @@ void LatteDecompiler_emitAttributeImport(LatteDecompilerShaderContext* shaderCon
 
 void LatteDecompiler_emitGLSLShader(LatteDecompilerShaderContext* shaderContext, LatteDecompilerShader* shader)
 {
-	StringBuf* src = new StringBuf(1024*1024*12); // reserve 12MB for generated source (we resize-to-fit at the end)
+	// Grow with emitted text instead of reserving 12 MB per concurrent shader.
+	// This is transient scratch capacity, never a shader/cache size limit.
+	StringBuf* src = new StringBuf(16*1024);
 	shaderContext->shaderSource = src;
 	// GLSL shader header
 	src->add("#version 430" _CRLF); // 430 is required for shader storage (Vulkan alternative TF path)
@@ -4141,6 +4143,7 @@ void LatteDecompiler_emitGLSLShader(LatteDecompilerShaderContext* shaderContext,
 	}
 	// end of shader main
 	src->add("}" _CRLF);
-	src->shrink_to_fit();
+	// The native bridge copies the finished source and immediately destroys
+	// this buffer. Shrinking here reallocates/copies it for no retained saving.
 	shader->strBuf_shaderSource = src;
 }

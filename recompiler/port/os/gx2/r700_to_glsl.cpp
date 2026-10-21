@@ -6,22 +6,52 @@
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h"
 #include "util/helpers/StringBuf.h"
-#include <regex>
+#include <string_view>
+
+namespace {
+struct OutputDeclaration {std::string_view location,qualifiers,name;};
+// Scan the emitter's output declaration grammar once. Keep captured spelling
+// (including interpolation qualifiers and whitespace) identical to the old
+// regex; other declarations are skipped without allocating a regex machine.
+std::vector<OutputDeclaration> vertex_outputs(std::string_view source) {
+    std::vector<OutputDeclaration> outputs;
+    auto space=[](char c){return c==' '||c=='\t'||c=='\r'||c=='\n'||c=='\f'||c=='\v';};
+    auto word=[](char c){return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_';};
+    size_t search=0;
+    while((search=source.find("layout",search))!=std::string_view::npos) {
+        size_t at=search+6;++search;
+        auto ws=[&]{const auto begin=at;while(at<source.size()&&space(source[at]))++at;return at!=begin;};
+        auto take=[&](std::string_view token){if(source.substr(at,token.size())!=token)return false;at+=token.size();return true;};
+        ws();if(!take("(location"))continue;ws();if(!take("="))continue;ws();
+        const size_t location=at;while(at<source.size()&&source[at]>='0'&&source[at]<='9')++at;
+        const auto number=source.substr(location,at-location);
+        if(number.empty()||!take(")"))continue;ws();const size_t qualifiers=at;
+        while(take("flat")||take("noperspective"))ws();
+        const auto interpolation=source.substr(qualifiers,at-qualifiers);
+        if(!take("out")||!ws()||!take("vec4")||!ws())continue;
+        const size_t name=at;while(at<source.size()&&word(source[at]))++at;
+        const auto identifier=source.substr(name,at-name);ws();
+        if(identifier.empty()||!take(";"))continue;
+        outputs.push_back({number,interpolation,identifier});search=at;
+    }
+    return outputs;
+}
+}
 
 thread_local ShaderHostState LatteGPUState;
 std::string r700_rect_geometry(const char* vertex_source,bool quad) {
-    const std::string vs=vertex_source?vertex_source:"";
+    const std::string_view vs=vertex_source?vertex_source:"";
     const bool point=vs.find("gl_PointSize;")!=std::string::npos;
     std::string gs=std::string("#version 430\nlayout(")+(quad?"lines_adjacency":"triangles")+") in;layout(triangle_strip,max_vertices=4) out;\nin gl_PerVertex{vec4 gl_Position;";
     if(point)gs+="float gl_PointSize;";
     gs+="}gl_in[];out gl_PerVertex{vec4 gl_Position;};\n";
     struct Varying {std::string name,input;bool flat;};std::vector<Varying> varyings;
-    const std::regex output(R"(layout\s*\(location\s*=\s*(\d+)\)\s*((?:flat\s*|noperspective\s*)*)out\s+vec4\s+(\w+)\s*;)");
-    for(std::sregex_iterator it(vs.begin(),vs.end(),output),end;it!=end;++it) {
-        const auto& m=*it;const std::string input="rbrew_rect_"+m[3].str();
-        gs+="layout(location="+m[1].str()+") "+m[2].str()+"in vec4 "+input+"[];\n";
-        gs+="layout(location="+m[1].str()+") "+m[2].str()+"out vec4 "+m[3].str()+";\n";
-        varyings.push_back({m[3].str(),input,m[2].str().find("flat")!=std::string::npos});
+    for(const auto& output:vertex_outputs(vs)) {
+        const std::string name(output.name),location(output.location),qualifiers(output.qualifiers);
+        const std::string input="rbrew_rect_"+name;
+        gs+="layout(location="+location+") "+qualifiers+"in vec4 "+input+"[];\n";
+        gs+="layout(location="+location+") "+qualifiers+"out vec4 "+name+";\n";
+        varyings.push_back({name,input,qualifiers.find("flat")!=std::string::npos});
     }
     gs+="void emitCorner(int a,int b,int c,bool generated){\n";
     for(const auto& v:varyings)gs+=v.name+"="+(v.flat?v.input+(quad?"[3]":"[2]"):("generated?"+v.input+"[b]+"+v.input+"[c]-"+v.input+"[a]:"+v.input+"[a]"))+";\n";
@@ -97,10 +127,11 @@ char* r700_to_glsl(const R700TranslateInput& in) {
     LatteDecompilerOutput_t out{};
     try {
         // An aligned private copy avoids aliasing and unaligned host reads.
-        std::vector<uint32_t> words(in.size/4);
-        std::memcpy(words.data(),in.data,in.size);
-        std::array<uint32_t, 0x10000> regs{};
+        auto words=std::make_unique_for_overwrite<uint32_t[]>(in.size/4);
+        std::memcpy(words.get(),in.data,in.size);
+        std::array<uint32_t, 0x10000> regs;
         if (in.context_registers) std::copy_n(in.context_registers,regs.size(),regs.data());
+        else regs.fill(0);
         LatteShader_CreatePSInputTable(&s_ps_inputs,regs.data());
         LatteFetchShader fetch;
         std::vector<LatteParsedFetchShaderAttribute> attrs;
@@ -129,8 +160,8 @@ char* r700_to_glsl(const R700TranslateInput& in) {
         options.strictMul=true;
         options.nativeVulkan=true;
         options.nativeVulkanNegativeOneToOne=in.vulkan_negative_one_to_one;
-        if (in.is_pixel) LatteDecompiler_DecompilePixelShader(0,regs.data(),reinterpret_cast<uint8_t*>(words.data()),in.size,options,&out);
-        else LatteDecompiler_DecompileVertexShader(0,regs.data(),reinterpret_cast<uint8_t*>(words.data()),in.size,&fetch,options,&out);
+        if (in.is_pixel) LatteDecompiler_DecompilePixelShader(0,regs.data(),reinterpret_cast<uint8_t*>(words.get()),in.size,options,&out);
+        else LatteDecompiler_DecompileVertexShader(0,regs.data(),reinterpret_cast<uint8_t*>(words.get()),in.size,&fetch,options,&out);
         if (!out.shader || out.shader->hasError || !out.shader->strBuf_shaderSource)
             throw std::runtime_error("Latte shader translation failed");
         if (in.info) {
@@ -181,14 +212,20 @@ char* r700_to_glsl(const R700TranslateInput& in) {
         s_last_reads.vs_parameter_mask=in.is_pixel?0:out.shader->outputParameterMask;
         for(unsigned t=0;t<LATTE_NUM_MAX_TEX_UNITS && t<32;++t)
             if(out.textureUnitMask[t])s_last_reads.texture_unit_mask|=1u<<t;
-        std::string translated=out.shader->strBuf_shaderSource->c_str();
-        if(!in.is_pixel) {
-            const auto line=translated.find('\n');
-            translated.insert(line+1,"layout(push_constant) uniform RbrewPushConstants { int rbrew_base_instance; };\n");
+        const auto* src=out.shader->strBuf_shaderSource->c_str();
+        const size_t length=out.shader->strBuf_shaderSource->size();
+        constexpr std::string_view push="layout(push_constant) uniform RbrewPushConstants { int rbrew_base_instance; };\n";
+        const size_t extra=in.is_pixel?0:push.size();
+        char* result=static_cast<char*>(std::malloc(length+extra+1));
+        if(result) {
+            // Assemble directly into the API's final buffer, avoiding an
+            // intermediate string, insertion/reallocation and strlen pass.
+            const char* line=extra?static_cast<const char*>(std::memchr(src,'\n',length)):nullptr;
+            const size_t prefix=line?size_t(line-src)+1:0;
+            std::memcpy(result,src,prefix);
+            if(extra)std::memcpy(result+prefix,push.data(),extra);
+            std::memcpy(result+prefix+extra,src+prefix,length-prefix+1);
         }
-        const auto* src=translated.c_str();
-        char* result=static_cast<char*>(std::malloc(std::strlen(src)+1));
-        if (result) std::strcpy(result,src);
         delete out.shader->strBuf_shaderSource; delete out.shader;
         return result;
     } catch (const std::exception& error) {

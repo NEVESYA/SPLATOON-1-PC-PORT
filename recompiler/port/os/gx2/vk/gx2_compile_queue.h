@@ -98,4 +98,21 @@ private:
     std::vector<std::thread> threads_;
     bool stopping_ = false;
 };
+// The render owner resolves a completed compilation once. Keep the promise and
+// work item for warm-up promotion/lifetime, but do not poll a future every draw.
+// Only the owner accesses this wrapper; compiler threads access pending's state.
+template<class T> class ResolvedCompileJob {
+public:
+    ResolvedCompileJob()=default;
+    ResolvedCompileJob(CompileQueue::Job<T> job):pending(std::move(job)){}
+    bool ready() const{return resolved_ || pending.ready();}
+    template<class Resolve> T get(Resolve&& resolve) {
+        if(!resolved_){value_=resolve(pending);resolved_=true;}
+        return value_;
+    }
+    CompileQueue::Job<T> pending;
+private:
+    T value_{};
+    bool resolved_=false;
+};
 } // namespace gx2vk

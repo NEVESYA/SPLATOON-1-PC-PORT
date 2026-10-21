@@ -31,3 +31,217 @@ The subsequent display-resolution update selects physical desktop pixels at laun
 The new Nintendo-free GPU regression failed on the old allocation path, then passed at 960x540, 1024x768, 1280x720, 1366x768, 1920x1080, 2560x1440 and 3840x2160. It draws alternating physical-pixel rows/columns beyond the old console edges and verifies scissored clears, depth conversion, sampled target scales, GPU/CPU surface copies, array aliases and full-size sRGB scan-out. A window-free SDL query detected display 0 at 2560x1440 / 165 Hz and display 1 at 1920x1080 / 75 Hz. No game launch was used for this update. The plaza's 30 FPS timing is untouched.
 
 Final display-resolution validation: incremental Release build succeeded; all 15 isolated CTest cases passed. `Game/Splatoon.exe` was updated from that build without launching it.
+
+The October 21 native optimization pass caches stable host synchronization objects
+per thread, specializes paired-single stores by quantization type, and resolves
+shader/program/pipeline futures once. An exact byte-key front cache reuses the
+last pipeline entry while retaining the complete pipeline map. MSVC Release
+host-runtime LTCG is enabled after compiler-support and benchmark checks;
+generated guest sources/objects keep their existing build policy. Floating-point
+semantics, ordered guest writes/reservation observers, cache capacities, worker
+counts, prewarming, render settings and timing policies are preserved.
+
+Interleaved Release component benchmarks on the i7-12650H (medians of three
+alternating runs, each reporting seven repetitions):
+
+| Same workload | Before | After |
+|---|---:|---:|
+| 1,000,000 paired float stores | 17.603 ms | 8.331 ms |
+| 1,000,000 quantized paired stores, u8/u16/s8/s16 | 19.908–21.721 ms | 12.472–14.316 ms |
+| 200,000 independent guest lock/unlock pairs, four threads | 18.911 ms | 1.073 ms |
+
+The production cache helpers' lookup model (1,000,000 lookups, 637-byte state keys,
+16-draw batches, seven repetitions) measured 689.346 ms for the previous hash/future
+path and 109.707 ms with exact-key/resolved-value reuse. These are component
+measurements, not game FPS. Repeat detile and render-handoff measurements found
+no material regression. Logs, baseline executables and the interleaved benchmark
+runner are under `build/advanced-*` and `build/run_advanced_benchmarks.py`.
+
+All 23 automated tests pass on both RTX 4050 and Intel UHD. Added coverage includes
+58,240 quantized-store cases against an independent `ldexp` reference, strict
+reservation invalidation, ordered write observers, recursive/contended locks,
+condition-variable handoffs, cache collisions and object reinitialization.
+Real Vulkan pipelines verify repeated-key reuse, distinct blend/topology state,
+warm-up job reuse and returning to an earlier key. Existing tests retain texture,
+display-resolution, upload-residency and shared-memory coverage. Validation layers
+remain unavailable; stable 60 FPS and gameplay frame-time distributions have not
+been established. These checks did not launch the game or load its saves.
+
+The source comparison used [Cemu's pipeline compiler](https://github.com/cemu-project/Cemu/blob/a53cf0ece75964aa361056edab46f281dcc0bc44/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineCompiler.cpp),
+[Dolphin's quantized-store specialization](https://github.com/dolphin-emu/dolphin/blob/cf5cb7ef81c3e8e7af5c9d566334219ffda9f68b/Source/Core/Core/PowerPC/Jit64/Jit_LoadStorePaired.cpp),
+[Dolphin's state tracker](https://github.com/dolphin-emu/dolphin/blob/cf5cb7ef81c3e8e7af5c9d566334219ffda9f68b/Source/Core/VideoBackends/Vulkan/StateTracker.cpp)
+and [PCSX2's selective-LTO build policy](https://github.com/PCSX2/pcsx2/blob/1f4dd94db0633679e49bdec7faa0dd5246123ad0/cmake/BuildParameters.cmake).
+Dolphin's Windows memory arena and block linker, plus PCSX2's fastmem mappings,
+were also inspected. The port already has direct base-plus-address guest RAM,
+native known-function calls, Windows write tracking, asynchronous compilation,
+dynamic rendering, timeline submissions and mapped rings. Replacing those with
+another MMU/JIT layer offers no identified saving. Extensions for graphics
+pipeline libraries and descriptor indexing are advertised by both drivers,
+but changing shader/resource binding architecture
+needs workload evidence; it was not enabled speculatively. PGO was not trained
+on synthetic workloads, and no process affinity, security or priority policy was
+changed.
+
+## Standalone cold shader pass, October 21
+
+No game executable was executed for this pass. `gambit_shader_bench` links only
+the host runtime and authored shaders/bytecode. It measures actual GX2 decoding,
+GLSL emission, glslang compilation, real graphics pipelines, offscreen shader
+pixels, draw recording, ring uploads, Vulkan allocations, worker scheduling and
+native dispatch. It never loads title assets or calls a game entry point.
+
+Implemented changes:
+
+- Parse original GLSL once. The glslang C wrapper otherwise serializes expanded
+  GLSL and preprocesses it again during parsing. Macro/version/extension handling
+  and compiler checks remain enabled. Already initialized workers use an atomic
+  fast path; disk hits do not initialize the compiler.
+  File-include shaders retain the original preprocessing fallback.
+- Append formatted shader text directly, with a `to_chars`/string fast path for
+  plain single replacements and the original general formatter for other forms.
+  Reserve decoded clause capacity once. Let transient text grow from 16 KiB
+  instead of reserving 12 MiB per shader and shrinking immediately before copying.
+  This changes scratch capacity, not cache size or shader limits.
+- Assemble returned source directly into its final allocation. Avoid zeroing
+  private bytecode/register storage immediately before overwriting every byte.
+  A missing register snapshot still initializes all registers to zero.
+- Scan geometry output declarations once instead of constructing/running regexes
+  over every source. The original regex implementation remains a test oracle.
+- Include the Cemu-derived translator in checked MSVC Release LTCG. Retain precise
+  floating point and reuse all generated guest objects incrementally.
+- Prepare the shader-cache directory once. Check cache file length before
+  trusting its word count, and check completed writes before replacing a cache.
+
+Seven alternating before/after process runs on this i7-12650H, using identical
+inputs and unchanged worker counts, produced these median totals:
+
+| Authored synthetic workload | Before | After |
+|---|---:|---:|
+| 60 uncached GLSL compilations, serial | 117.765 ms | 91.673 ms |
+| Same 60 compilations, four workers | 32.230 ms | 20.675 ms |
+| 60 requests into an empty SPIR-V disk cache | 156.480 ms | 108.476 ms |
+| 240 GX2-to-GLSL translations | 10.104 ms | 5.245 ms |
+| 160 rectangle geometry translations, 32 varyings | 26.644 ms | 3.564 ms |
+| 50,000 tiny worker tasks | 43.561 ms | 43.143 ms |
+
+Cold serial per-shader median/P95/P99 changed from 1.3443/2.5787/28.1774 ms to
+0.8981/2.0471/26.9539 ms. Stage built-in initialization contributes the P99 outlier.
+Process-first compiler initialization remained about 74 ms; it is not
+claimed as a significant improvement. The disk corpus contains 58 unique sources
+and two duplicates; both versions use identical deduplication. The cache-disabled
+serial and parallel phases really compile all 60 requests. Warm disk hit rate is
+100%; warm I/O fluctuated around 6–8 ms and is not claimed as a speedup. In the
+final comparison it increased from 5.825 to 7.240 ms for 60 requests. A separate
+same-process reader comparison isolates the small cost of validating actual file
+length, retained to prevent corrupted headers from requesting enormous memory.
+This is a startup-cache correctness tradeoff, not a memory-saving speed claim.
+
+Translator-only peak process commit was 14,946,304 -> 2,326,528 bytes; resident
+working set stayed about 9 MB. Most of that change is removal of the speculative
+12 MiB transient reserve. Compiler-process peak memory remained about 59 MB.
+No shader/pipeline cache, precompilation coverage, worker count, graphical
+setting, memory budget or GPU memory placement was reduced.
+
+Pipeline timings use a fresh **application** `VkPipelineCache`; vendor driver
+caches are opaque and were not cleared. No driver-cold pipeline acceleration or
+in-game FPS is claimed. Tiny draw-recording totals varied by microseconds between
+the two benchmark binaries; these are not frame times. Driver heap usage/budget
+sampling runs separately in `gpu_memory`, since sampling can perturb timing.
+These are driver allocation estimates, not measured dedicated-VRAM residency;
+an integrated GPU's local heap is shared RAM. `checkpoint_peak_bytes` records
+owned allocation checkpoints, and process peak commit/working set come from
+Windows. CPU time uses process accounting and has Windows accounting granularity.
+
+Reusable commands, which execute only authored standalone tests:
+
+```powershell
+build/game/Release/gambit_shader_bench.exe compiler
+build/game/Release/gambit_shader_bench.exe translation
+build/game/Release/gambit_shader_bench.exe scheduling
+build/game/Release/gambit_shader_bench.exe engine
+build/game/Release/gambit_shader_bench.exe gpu
+build/game/Release/gambit_shader_bench.exe gpu_memory
+python recompiler/tests/run_shader_benchmarks.py --baseline build/shader-before/gambit_shader_bench.exe
+```
+
+The runner accepts only executables named `gambit_shader_bench.exe`, alternates
+run order, preserves raw JSON samples, and compares output checksums. `--case`
+selects a workload; `--gpu` selects either/both installed adapters or CPU-only
+testing. Raw comparisons are in `build/shader-final-benchmark-results.json`.
+
+Output checks include exact SPIR-V equality against the original two-pass
+compiler, macro/line directive handling, invalid-source errors, geometry output
+equality, integer/hex/string formatting, null-register snapshots, cache corruption
+recovery, and concurrent queue consumers/exception/reference/move-only results.
+Real offscreen GPU checks verify all 32 authored R700 pixel shaders and every
+byte of a 16 MiB streamed upload. Other suites retain paired-store, detile,
+texture/context reuse and shared/UMA memory fallback coverage.
+
+The task-allocation/queue-layout rewrite was rejected after tiny-task throughput
+regressed. The renderer already bypasses completed jobs, so adding a ready-result
+shortcut to the queue itself was also dropped; its direct API benchmark was not
+a representative renderer saving. A native Windows cache-reader experiment was
+removed because it did not beat the existing buffered reader reliably. Source research compared
+[Dolphin's single-parse compiler](https://github.com/dolphin-emu/dolphin/blob/cf5cb7ef81c3e8e7af5c9d566334219ffda9f68b/Source/Core/VideoCommon/Spirv.cpp),
+[Cemu's shader compiler](https://github.com/cemu-project/Cemu/blob/a53cf0ece75964aa361056edab46f281dcc0bc44/src/Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.cpp)
+and [PCSX2's Vulkan cache](https://github.com/PCSX2/pcsx2/blob/1f4dd94db0633679e49bdec7faa0dd5246123ad0/pcsx2/GS/Renderers/Vulkan/VKShaderCache.cpp).
+Only applicable techniques were adapted; shader optimizers, additional pipeline
+architectures and synthetic PGO were not enabled without supporting evidence.
+
+The final incremental Release build succeeded with all generated guest objects
+reused. All 29 CTest cases pass on both RTX 4050 and Intel UHD. Final test logs and
+driver heap samples are in `build/shader-final-{nvidia,intel}-test-details.log`;
+`build/shader-verification.json` records source hashes and the delivered binary.
+`Game/Splatoon.exe` SHA-256 is
+`264426d155880d92bd655b56f737f685c8af07f25427f7563a7f4a9965a35dd4`.
+No game launch or actual in-game FPS, physics, gameplay or audio validation was
+performed.
+
+## Rendering follow-up (2026-10-21)
+
+The ordinary-descriptor fallback now caches exact resource bindings within each
+submission, streams uniform offsets through dynamic UBO descriptors up to the
+device's advertised limit, and resets retired pools only after GPU completion.
+Push descriptors retain their supported descriptor types. Index bindings are
+shadowed, immutable vertex semantics are collected once, identical sampler
+parameters bypass repeated normalization, and raster validation is repeated
+inside a draw only when command state was invalidated. Idle completion queries
+and the unused pre-submission completion poll were removed. Shader prewarming,
+worker counts, cache capacities, rendering quality and memory policy are unchanged.
+
+`gambit_render_bench` links only the runtime and authored shaders. It submits
+16,384 indexed draws with texture changes, four pipeline variants, uniform
+changes, scissor changes and two render targets, then checks 4,096 pixels.
+Seven alternating baseline/candidate runs produced these median total times:
+
+| Workload | RTX 4050 before → after | Intel UHD before → after |
+| --- | --- | --- |
+| Reused fallback descriptors | 17.124 → 12.783 ms | 22.470 → 15.550 ms |
+| Push descriptors | 15.767 → 11.572 ms | 17.062 → 13.003 ms |
+| Changing uniforms with fallback descriptors | 17.861 → 13.998 ms | 23.982 → 16.627 ms |
+
+These are synthetic CPU recording/submission/completion times, not frame times
+or measured game FPS. Descriptor updates fall from 16,384 to 512 in the fallback
+workloads and index binds from 16,384 to 16; draw and submission counts and
+barriers remain equal. `build/render-benchmark-results.json` retains every run.
+`recompiler/tests/run_render_benchmarks.py` repeats the comparison and accepts
+only the standalone benchmark executable name.
+
+The separate `contracts` case checks dynamic-offset binding order, cache keys,
+pool-exhaustion recovery, bounded device-OOM failure, sampler identity and state
+invalidation. `lifetime` holds 16 submissions behind a host-signalled timeline
+semaphore while replacing/uploading textures; it proves that live pools are
+retained and reused after completion, with correct output. These cases also run
+on both GPUs. The cache-reader experiment was rejected: controlled reads improved
+but total warm-cache requests did not reliably improve, so integrity checks and
+the existing reader are retained.
+
+Source comparisons used [Cemu's dynamic uniform descriptors](https://github.com/cemu-project/Cemu/blob/a53cf0ece75964aa361056edab46f281dcc0bc44/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp),
+[Dolphin's state invalidation](https://github.com/dolphin-emu/dolphin/blob/cf5cb7ef81c3e8e7af5c9d566334219ffda9f68b/Source/Core/VideoBackends/Vulkan/StateTracker.cpp)
+and [PCSX2's Vulkan state tracking](https://github.com/PCSX2/pcsx2/blob/1f4dd94db0633679e49bdec7faa0dd5246123ad0/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp).
+No game executable was launched.
+
+The incremental Release build and all 34 tests passed on each adapter, with all
+five new rendering cases also passing with serial command recording. The built
+binary was copied to `Game/Splatoon.exe` and its hash verified against the build.
+`build/render-verification.json` records the binary/source hashes and final logs.

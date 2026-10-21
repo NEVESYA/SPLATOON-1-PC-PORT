@@ -73,6 +73,7 @@ struct TexParams {
     float min_lod = -1000.0f, max_lod = 1000.0f, lod_bias = 0.0f, anisotropy = 1.0f;
     std::array<float, 4> border{};
     uint32_t compare_mode = 0, compare_func = wire::LEQUAL;
+    bool operator==(const TexParams&) const = default;
 };
 struct TexObject {
     gx2vk::Image* image = nullptr;       // storage (may be null: no storage = incomplete)

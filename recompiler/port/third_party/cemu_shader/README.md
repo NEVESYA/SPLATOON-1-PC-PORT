@@ -6,4 +6,10 @@ The adapter parses Latte instructions and emits one native Vulkan GLSL interface
 
 The integration uses standard containers and C++20 formatting, checked translation errors, caller-supplied registers and explicit shader options. It does not contain an emulator renderer, graphics-pack system, guest memory arena or per-game profiles. Unsupported/truncated instructions fail translation.
 
+The native emitter grows its scratch string on demand, appends formatted output
+directly, and specializes plain register-number/name replacements with a general
+formatter fallback. Decoded clauses reserve their encoded upper bound once.
+Release LTCG includes the translator when supported. None of these changes
+changes the generated GLSL interface, floating-point rules or shader coverage.
+
 GPU fixtures exercise shader exports, resource bindings, comparisons, integer bits, mip/slice views, clipping and stream-out. Saved game captures and original reference material remain outside this source directory.

@@ -432,6 +432,9 @@ void LatteDecompiler_ParseALUClause(LatteDecompilerShader* shaderContext, LatteD
 {
 	if ((uint64(cfInstruction->addr) + cfInstruction->count) * 8 > programSize)
 		throw std::runtime_error("Latte ALU clause exceeds program");
+	// Encoded count bounds the decoded instruction count (literal words may
+	// make it smaller). Allocate once instead of copying the growing IR.
+	cfInstruction->instructionsALU.reserve(cfInstruction->count);
 	sint32 instructionGroupIndex = 0;
 	sint32 indexInGroup = 0; // index of instruction within instruction group
 	uint32 elementsWrittenMask = 0; // used to determine ALU/Trans unit for instructions
@@ -640,6 +643,7 @@ void LatteDecompiler_ParseTEXClause(LatteDecompilerShader* shaderContext, LatteD
 {
 	if (uint64(cfInstruction->addr) * 8 + uint64(cfInstruction->count) * 16 > programSize)
 		throw std::runtime_error("Latte TEX clause exceeds program");
+	cfInstruction->instructionsTEX.reserve(cfInstruction->count);
 	for(sint32 i=0; i<cfInstruction->count; i++)
 	{
 		// each instruction is 128bit

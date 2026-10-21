@@ -158,7 +158,7 @@ bool read_texture_level(TexObject& tex, uint32_t level, uint32_t width, uint32_t
     dependency.memoryBarrierCount = 1; dependency.pMemoryBarriers = &host;
     vkCmdPipelineBarrier2(cb, &dependency);
     gx2vk::note_gpu_write();
-    const bool ok = gx2vk::finish();
+    const bool ok = gx2vk::finish() && gx2vk::invalidate_mapped(buffer.memory);
     if (ok) {
         out.resize(size_t(bytes / 4));
         std::memcpy(out.data(), buffer.memory.mapped, bytes);
@@ -767,6 +767,7 @@ bool gx2_render_replay_capture(const char* path, uint8_t* mem, void (*commit)(ui
     };
     out.fragments_no_depth_cull = pass(false);
     out.fragments = pass(true);
+    bool memory_ok = true;
     // Vertex outputs: gl_Position of the assembled vertices via transform
     // feedback of the same program, reported in the GPU clip convention
     // (the Vulkan vertex stage stores z' = (z + w) / 2).
@@ -782,6 +783,12 @@ bool gx2_render_replay_capture(const char* path, uint8_t* mem, void (*commit)(ui
         auto buffer = gx2vk::create_buffer(VkDeviceSize(capacity) * 16, VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT, gx2vk::MemoryUse::Readback);
         if (buffer.buffer) {
             std::memset(buffer.memory.mapped, 0, size_t(capacity) * 16);
+            if (!gx2vk::flush_mapped(buffer.memory)) {
+                memory_ok = false;
+                gx2vk::destroy_buffer(buffer);
+            }
+        }
+        if (buffer.buffer) {
             s_xfb_buffer = buffer.buffer; s_xfb_offset = 0; s_xfb_capacity = capacity;
             s_xfb_step = assembled * (instance_state[1] ? 1 : instance_state[0]);
             gx2r_set_xfb_hook([](bool before, VkCommandBuffer cb) {
@@ -812,12 +819,14 @@ bool gx2_render_replay_capture(const char* path, uint8_t* mem, void (*commit)(ui
             VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
             dependency.memoryBarrierCount = 1; dependency.pMemoryBarriers = &host;
             vkCmdPipelineBarrier2(gx2vk::cmd(), &dependency);
-            gx2vk::finish();
-            const uint32_t vertices = uint32_t(std::min<uint64_t>(uint64_t(assembled) * instance_state[0], capacity));
-            out.positions.assign(size_t(vertices) * 4, 0.0f);
-            std::memcpy(out.positions.data(), buffer.memory.mapped, size_t(vertices) * 16);
-            if (!gx2vk::caps().negative_one_to_one && !(S.regs[0xA204] & (1u << 19)))
-                for (size_t i = 0; i < vertices; ++i) out.positions[i * 4 + 2] = 2.0f * out.positions[i * 4 + 2] - out.positions[i * 4 + 3];
+            memory_ok = gx2vk::finish() && gx2vk::invalidate_mapped(buffer.memory);
+            if (memory_ok) {
+                const uint32_t vertices = uint32_t(std::min<uint64_t>(uint64_t(assembled) * instance_state[0], capacity));
+                out.positions.assign(size_t(vertices) * 4, 0.0f);
+                std::memcpy(out.positions.data(), buffer.memory.mapped, size_t(vertices) * 16);
+                if (!gx2vk::caps().negative_one_to_one && !(S.regs[0xA204] & (1u << 19)))
+                    for (size_t i = 0; i < vertices; ++i) out.positions[i * 4 + 2] = 2.0f * out.positions[i * 4 + 2] - out.positions[i * 4 + 3];
+            }
             gx2vk::destroy_buffer(buffer);
             s_xfb_buffer = VK_NULL_HANDLE;
         }
@@ -839,7 +848,7 @@ bool gx2_render_replay_capture(const char* path, uint8_t* mem, void (*commit)(ui
     gx2vk::destroy_image(color.image);
     if (m.has_depth) gx2vk::destroy_image(depth.image);
     gx2vk::finish();
-    return true;
+    return memory_ok;
 }
 
 #include "gx2_render_vk_debug.h"

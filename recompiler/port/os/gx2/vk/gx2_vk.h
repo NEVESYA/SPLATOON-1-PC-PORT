@@ -12,8 +12,8 @@
 // renderer calls barrier_if_dirty() before it starts a rendering instance,
 // a transfer or a readback, which records one global memory dependency from
 // all prior commands to all later ones. Host writes into mapped memory are
-// made visible by queue submission; mapped memory is reused only after the
-// submission that read it has completed.
+// flushed when non-coherent, then made visible by queue submission. Mapped
+// memory is reused only after the submission that read it has completed.
 #define VK_NO_PROTOTYPES
 #include <volk.h>
 #include <cstddef>
@@ -73,20 +73,31 @@ std::string last_validation_error();
 struct Allocation {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize offset = 0, size = 0;
-    uint8_t* mapped = nullptr;           // host pointer at offset (host-visible types)
+    uint8_t* mapped = nullptr;           // host pointer at offset (Upload/Readback)
     int32_t block = -1;                  // allocator block, -1 = dedicated
     uint32_t pool = 0;
+    uint32_t memory_type = 0;
+    VkMemoryPropertyFlags properties = 0;
+    VkDeviceSize backing_size = 0;       // bounds atom-aligned flush/invalidate ranges
     explicit operator bool() const { return memory != VK_NULL_HANDLE; }
 };
 enum class MemoryUse { DeviceLocal, Upload, Readback };
-Allocation allocate(const VkMemoryRequirements& requirements, MemoryUse use, bool linear_resource);
+Allocation allocate(const VkMemoryRequirements& requirements, MemoryUse use, bool linear_resource,
+                    const VkMemoryDedicatedAllocateInfo* dedicated = nullptr);
 void free_now(Allocation& allocation);
+const VkPhysicalDeviceMemoryProperties& memory_properties();
+// Direct mapped-buffer writes must be flushed before GPU use; reads must be
+// invalidated after GPU completion and a GPU -> HOST memory dependency.
+// Coherent memory takes the no-op fast path. Upload spans flush at submission.
+bool flush_mapped(const Allocation& allocation, VkDeviceSize offset = 0, VkDeviceSize bytes = VK_WHOLE_SIZE);
+bool invalidate_mapped(const Allocation& allocation, VkDeviceSize offset = 0, VkDeviceSize bytes = VK_WHOLE_SIZE);
 uint64_t allocated_bytes();
 struct MemoryUsage {
     uint64_t device_local = 0, host_only = 0, host_visible_device_local = 0;
 };
-// Application-owned allocations by heap placement, not driver residency or
-// shader/pipeline internals. Host-visible VRAM remains part of device_local.
+// Application-owned allocations by memory properties, not driver residency or
+// dedicated VRAM. device_local includes shared UMA RAM; host_only is non-local
+// GPU-accessible memory. Host-visible local memory remains part of device_local.
 MemoryUsage memory_usage();
 
 // ---- submissions and lifetime -------------------------------------------

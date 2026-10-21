@@ -137,6 +137,7 @@ void textures() {
     require(gx2vk::finish(), "GPU texture submission failed");
     require(bool(cold.image), "unbound reusable texture was evicted");
     require(active && active->image && *active->image, "bound texture storage was evicted");
+    require(gx2vk::invalidate_mapped(readback.memory), "in-flight readback invalidation failed");
     for (unsigned i = 0; i < size; ++i) require(readback.memory.mapped[i] == 0x42, "in-flight texture copy was corrupted");
     gx2vk::destroy_buffer(readback);
     const auto count = gx2_render_texture_upload_count();

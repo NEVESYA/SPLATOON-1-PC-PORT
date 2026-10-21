@@ -13,10 +13,9 @@
 #include <future>
 #include <mutex>
 #include <optional>
-
 namespace gx2vk {
 namespace {
-bool s_glslang = false;
+std::atomic<bool> s_glslang{false};
 std::string s_cache_dir;
 // Module identity: stage, source length and the two 64-bit source hashes
 // that also name its on-disk SPIR-V (disk_path). Keying on the full source
@@ -68,21 +67,26 @@ std::string disk_path(const ModuleKey& key) {
 }
 
 bool load_disk(const std::string& path, size_t source_size, std::vector<uint32_t>& spirv) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) return false;
+    std::ifstream file(path,std::ios::binary|std::ios::ate);
+    if(!file)return false;
+    const auto bytes=file.tellg();
+    file.seekg(0,std::ios::beg);
     uint64_t header[2]{};
     if (!file.read(reinterpret_cast<char*>(header), sizeof(header))) return false;
     if (header[0] != (0x52425350ull << 32 | kCacheRevision) || header[1] == 0) return false;
     // header[1] = source length << 32 | word count
     if ((header[1] >> 32) != source_size) return false;
-    spirv.resize(size_t(header[1] & 0xFFFFFFFFu));
-    if (!file.read(reinterpret_cast<char*>(spirv.data()), std::streamsize(spirv.size() * 4))) return false;
+    const auto words=uint32_t(header[1]);
+    // Validate against the actual file, not a guessed memory ceiling. A
+    // truncated cache must not allocate a corrupt header's claimed size.
+    if(bytes<0 || uint64_t(bytes)!=sizeof(header)+uint64_t(words)*4)return false;
+    spirv.resize(words);
+    if (!file.read(reinterpret_cast<char*>(spirv.data()),std::streamsize(spirv.size()*4))) return false;
     return !spirv.empty() && spirv[0] == 0x07230203u;
 }
 
 void store_disk(const std::string& path, size_t source_size, const std::vector<uint32_t>& spirv) {
     std::error_code ignored;
-    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ignored);
     const std::string temp = path + ".tmp";
     {
         std::ofstream file(temp, std::ios::binary | std::ios::trunc);
@@ -90,6 +94,8 @@ void store_disk(const std::string& path, size_t source_size, const std::vector<u
         const uint64_t header[2] = {0x52425350ull << 32 | kCacheRevision, uint64_t(source_size) << 32 | spirv.size()};
         file.write(reinterpret_cast<const char*>(header), sizeof(header));
         file.write(reinterpret_cast<const char*>(spirv.data()), std::streamsize(spirv.size() * 4));
+        file.close();
+        if(!file)return;
     }
     std::filesystem::rename(temp, path, ignored);
 }
@@ -108,20 +114,28 @@ uint64_t stable_hash(const void* data, size_t bytes, uint64_t seed) {
     return h;
 }
 
-void shader_set_cache_dir(const std::string& directory) { s_cache_dir = directory; }
+void shader_set_cache_dir(const std::string& directory) {
+    // Configuration happens before compiler work starts. Prepare once instead
+    // of repeating filesystem metadata queries on every cold compilation.
+    s_cache_dir = directory;
+    if(!directory.empty()) {
+        std::error_code ignored;
+        std::filesystem::create_directories(std::filesystem::path(directory)/"spirv",ignored);
+    }
+}
 const std::string& shader_cache_dir() { return s_cache_dir; }
 
 static bool compile_glsl_cached(VkShaderStageFlagBits stage, const std::string& source, const ModuleKey& key,
         std::vector<uint32_t>& spirv, std::string* log) {
-    {
-        std::lock_guard lock(s_glslang_mutex);
-        if (!s_glslang) {
-            if (!glslang_initialize_process()) return false;
-            s_glslang = true;
-        }
-    }
     const std::string path = s_cache_dir.empty() ? std::string() : disk_path(key);
     if (!path.empty() && load_disk(path, source.size(), spirv)) { ++s_disk_hits; return true; }
+    if (!s_glslang.load(std::memory_order_acquire)) {
+        std::lock_guard lock(s_glslang_mutex);
+        if (!s_glslang.load(std::memory_order_relaxed)) {
+            if (!glslang_initialize_process()) return false;
+            s_glslang.store(true,std::memory_order_release);
+        }
+    }
     glslang_input_t input{};
     input.language = GLSLANG_SOURCE_GLSL;
     input.stage = glslang_stage(stage);
@@ -137,7 +151,19 @@ static bool compile_glsl_cached(VkShaderStageFlagBits stage, const std::string& 
     input.messages = static_cast<glslang_messages_t>(GLSLANG_MSG_SPV_RULES_BIT | GLSLANG_MSG_VULKAN_RULES_BIT);
     input.resource = glslang_default_resource();
     glslang_shader_t* shader = glslang_shader_create(&input);
-    bool ok = shader && glslang_shader_preprocess(shader, &input) && glslang_shader_parse(shader, &input);
+    // The C wrapper's parse() reads this buffer, then TShader::parse performs
+    // preprocessing itself. Feed it the original source: expanding and
+    // serializing GLSL first would run the preprocessor twice. Macros,
+    // version/extension directives and semantic checks still run in parse.
+    if (shader) glslang_shader_set_preprocessed_code(shader,source.c_str());
+    bool ok = shader && glslang_shader_parse(shader, &input);
+    // TShader::parse in the C wrapper uses a ForbidIncluder. Preserve the
+    // previous file-include capability for diagnostic/authored shaders; the
+    // GX2 emitter's self-contained sources stay on the single-pass path.
+    if(!ok && shader && std::strstr(glslang_shader_get_info_log(shader),"include")) {
+        glslang_shader_delete(shader);shader=glslang_shader_create(&input);
+        ok=shader&&glslang_shader_preprocess(shader,&input)&&glslang_shader_parse(shader,&input);
+    }
     glslang_program_t* program = nullptr;
     if (ok) {
         program = glslang_program_create();
@@ -259,11 +285,20 @@ void shader_shutdown() {
     }
     s_modules.clear();
     s_pipeline_cache = VK_NULL_HANDLE;
-    if (s_glslang) { glslang_finalize_process(); s_glslang = false; }
+    if (s_glslang.load(std::memory_order_acquire)) {
+        glslang_finalize_process();s_glslang.store(false,std::memory_order_release);
+    }
 }
 
 uint64_t shader_compile_count() { return s_compiles; }
 uint64_t shader_disk_hits() { return s_disk_hits; }
 uint64_t shader_module_count() { std::lock_guard lock(s_module_mutex); return s_modules.size(); }
+
+#ifdef RBREW_ADVANCED_TESTS
+// Standalone I/O benchmark calls the actual reader, without compiler/hash work.
+bool shader_test_load_disk(const std::string& path,size_t source_size,std::vector<uint32_t>& words) {
+    return load_disk(path,source_size,words);
+}
+#endif
 
 }  // namespace gx2vk

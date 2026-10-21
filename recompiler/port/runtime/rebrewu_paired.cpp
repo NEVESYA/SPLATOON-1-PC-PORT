@@ -35,9 +35,6 @@ float truncate_single(double v) {
 
 enum QuantType : uint32_t { QFloat = 0, QU8 = 4, QU16 = 5, QS8 = 6, QS16 = 7 };
 int signed_scale(uint32_t scale) { int e = int(scale & 0x3F); return e - ((e & 32) << 1); }
-uint32_t quant_size(uint32_t type) {
-    return type == QU8 || type == QS8 ? 1u : type == QU16 || type == QS16 ? 2u : 4u;
-}
 void require_type(uint32_t type) {
     if (type != QFloat && (type < QU8 || type > QS16))
         throw std::runtime_error("psq: GQR selects an undefined quantization type " + std::to_string(type));
@@ -61,23 +58,26 @@ template <typename T> T saturate(double v) {
     const double lo = double(std::numeric_limits<T>::min()), hi = double(std::numeric_limits<T>::max());
     return T(std::max(lo, std::min(v, hi)));
 }
-void quantize(CPUState* cpu, uint32_t ea, double v, uint32_t type, uint32_t scale) {
-    const int e = signed_scale(scale);
-    const bool nan = std::isnan(v), neg = std::signbit(v);
-    switch (type) {
-    case QFloat: {
+template<class T> void store_quantized(CPUState* cpu, uint32_t ea, double v, double factor) {
+    if constexpr(std::is_same_v<T,float>) {
         uint64_t d; std::memcpy(&d, &v, 8);
         const uint32_t exponent = uint32_t(d >> 52) & 0x7FF;
         // Values below the single range store a signed zero (decaf).
-        rbrew_write32(cpu->mem, ea, exponent <= 896 ? (neg ? 0x80000000u : 0u) : as_bits(float(v)));
-        return;
+        rbrew_write32(cpu->mem, ea, exponent <= 896 ? (std::signbit(v) ? 0x80000000u : 0u) : as_bits(float(v)));
+    } else {
+        // The factor is an exact, normal double. Saturation and signed-NaN
+        // treatment stay identical to the ldexp path for every GQR scale.
+        const T value=std::isnan(v) ? (std::signbit(v)?std::numeric_limits<T>::min():std::numeric_limits<T>::max())
+                                  : saturate<T>(v*factor);
+        if constexpr(sizeof(T)==1)rbrew_write8(cpu->mem,ea,uint8_t(value));
+        else rbrew_write16(cpu->mem,ea,uint16_t(value));
     }
-    case QU8:  rbrew_write8(cpu->mem, ea, nan ? (neg ? 0 : 0xFF) : saturate<uint8_t>(std::ldexp(v, e))); return;
-    case QU16: rbrew_write16(cpu->mem, ea, nan ? (neg ? 0 : 0xFFFF) : saturate<uint16_t>(std::ldexp(v, e))); return;
-    case QS8:  rbrew_write8(cpu->mem, ea, uint8_t(nan ? (neg ? -0x80 : 0x7F) : saturate<int8_t>(std::ldexp(v, e)))); return;
-    case QS16: rbrew_write16(cpu->mem, ea, uint16_t(nan ? (neg ? -0x8000 : 0x7FFF) : saturate<int16_t>(std::ldexp(v, e)))); return;
-    }
-    require_type(type);
+}
+template<class T> void store_pair(CPUState* cpu,uint32_t frs,uint32_t ea,uint32_t w,uint32_t scale) {
+    const double factor=std::is_same_v<T,float>?1.0:std::bit_cast<double>(uint64_t(1023+signed_scale(scale))<<52);
+    store_quantized<T>(cpu,ea,cpu->f[frs],factor);
+    // Preserve separate ordered stores, with existing bounds and write observers.
+    if(!w)store_quantized<T>(cpu,ea+uint32_t(sizeof(T)),cpu->ps1[frs],factor);
 }
 
 void psq_load(CPUState* cpu, uint32_t frd, uint32_t ea, uint32_t w, uint32_t i) {
@@ -93,9 +93,14 @@ void psq_load(CPUState* cpu, uint32_t frd, uint32_t ea, uint32_t w, uint32_t i) 
 }
 void psq_store(CPUState* cpu, uint32_t frs, uint32_t ea, uint32_t w, uint32_t i) {
     const uint32_t g = cpu->gqr[i], type = g & 7, scale = (g >> 8) & 0x3F;
-    require_type(type);
-    quantize(cpu, ea, cpu->f[frs], type, scale);
-    if (!w) quantize(cpu, ea + quant_size(type), cpu->ps1[frs], type, scale);
+    switch(type) {
+    case QFloat:return store_pair<float>(cpu,frs,ea,w,scale);
+    case QU8:return store_pair<uint8_t>(cpu,frs,ea,w,scale);
+    case QU16:return store_pair<uint16_t>(cpu,frs,ea,w,scale);
+    case QS8:return store_pair<int8_t>(cpu,frs,ea,w,scale);
+    case QS16:return store_pair<int16_t>(cpu,frs,ea,w,scale);
+    default:require_type(type);return;
+    }
 }
 
 void set_pair(CPUState* cpu, uint32_t d, double p0, double p1) { cpu->f[d] = p0; cpu->ps1[d] = p1; }

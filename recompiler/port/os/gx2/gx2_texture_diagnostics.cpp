@@ -182,6 +182,10 @@ void drain_probes(bool shutdown) {
     const auto done=gx2vk::known_completed_serial();
     while(!pending.empty() && pending.front().serial<=done) {
         auto p=pending.front();pending.pop_front();
+        if(!gx2vk::invalidate_mapped(p.buffer.memory)) {
+            vkDestroyBuffer(gx2vk::device(),p.buffer.buffer,nullptr);gx2vk::free_now(p.buffer.memory);
+            continue;
+        }
         const std::string name="image-"+std::to_string(p.id)+"-f"+std::to_string(p.frame)+".bin";
         bool saved=false;
         if(raw_bytes+p.buffer.size<=(128ull<<20)) {

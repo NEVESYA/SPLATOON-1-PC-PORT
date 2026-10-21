@@ -18,6 +18,7 @@
 #include "vk/gx2_render_vk_state.h"
 #include "vk/gx2_vk_shader.h"
 #include "vk/gx2_compile_queue.h"
+#include "vk/gx2_last_lookup.h"
 #include "../os_common.h"
 #include <algorithm>
 #include <array>
@@ -66,6 +67,7 @@ uint64_t s_submitted_primitives = 0;
 Framebuffer s_active_fb;
 VkRect2D s_area{};
 uint64_t s_dynamic_serial = 0;      // command buffer the tracked state belongs to
+uint64_t s_tracking_epoch = 0;      // includes internal transfers within one command buffer
 VkPipeline s_bound_pipeline = VK_NULL_HANDLE;
 struct DynamicState {
     VkViewport viewport{}; VkRect2D scissor{};
@@ -96,6 +98,9 @@ struct BindingState {
     std::array<DescriptorValue,70> descriptors{};
     std::array<VkBuffer,kMaxVertexInputs> vertex_buffers{};
     std::array<VkDeviceSize,kMaxVertexInputs> vertex_offsets{};
+    VkBuffer index_buffer=VK_NULL_HANDLE;
+    VkDeviceSize index_offset=0;
+    VkIndexType index_type=VK_INDEX_TYPE_MAX_ENUM;
     int32_t instance=0;
 } s_bindings;
 
@@ -141,10 +146,18 @@ void bind_vertices(VkCommandBuffer cb,uint32_t count,const VkBuffer* buffers,con
     std::copy_n(buffers,count,s_bindings.vertex_buffers.begin());std::copy_n(offsets,count,s_bindings.vertex_offsets.begin());
 }
 
+void bind_indices(VkCommandBuffer cb,VkBuffer buffer,VkDeviceSize offset,VkIndexType type) {
+    if(buffer==s_bindings.index_buffer && offset==s_bindings.index_offset && type==s_bindings.index_type)return;
+    vkCmdBindIndexBuffer(cb,buffer,offset,type);
+    s_bindings.index_buffer=buffer;s_bindings.index_offset=offset;s_bindings.index_type=type;
+}
+
 void reset_command_tracking() {
+    ++s_tracking_epoch;
     s_dyn = DynamicState{};
     s_bindings.descriptor_layout = s_bindings.constant_layout = VK_NULL_HANDLE;
     s_bindings.descriptor_count = s_bindings.vertex_count = 0;
+    s_bindings.index_buffer = VK_NULL_HANDLE;
     s_bound_pipeline = VK_NULL_HANDLE;
     s_dynamic_serial = gx2vk::recording_serial();
 }
@@ -238,9 +251,6 @@ void gx2r::end_rendering() {
 
 void gx2r::before_submit() {
     end_rendering();
-    // Deferred query slots whose submissions completed can be reused.
-    const uint64_t done = gx2vk::completed_serial();
-    (void)done;
     s_dynamic_serial = 0;
 }
 
@@ -513,15 +523,26 @@ void gx2r_sampler_info(const TexParams& p, bool shadow, bool integer, VkSamplerC
     else info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
 }
 
+namespace {
+struct LastSampler {
+    TexParams params;
+    VkSampler sampler=VK_NULL_HANDLE;
+    bool shadow=false, integer=false;
+} s_last_sampler;
+}
 VkSampler gx2r::tex_object_sampler(const TexParams& p, bool shadow, bool integer) {
+    if(s_last_sampler.sampler && s_last_sampler.shadow==shadow && s_last_sampler.integer==integer && s_last_sampler.params==p)
+        return s_last_sampler.sampler;
     VkSamplerCreateInfo info;
     gx2r_sampler_info(p, shadow, integer, info);
+    VkSampler result=VK_NULL_HANDLE;
     if (info.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT || info.borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT) {
         VkClearColorValue color{};
         std::memcpy(color.float32, p.border.data(), 16);
-        return gx2vk::sampler(info, &color);
-    }
-    return gx2vk::sampler(info);
+        result=gx2vk::sampler(info, &color);
+    } else result=gx2vk::sampler(info);
+    s_last_sampler={p,result,shadow,integer};
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +586,9 @@ template<class T> T await_compile(const gx2vk::CompileQueue::Job<T>& job) {
     if (job.ready()) return job.result.get();
     return s_compile_queue ? s_compile_queue->get(job) : job.result.get();
 }
+template<class T> T await_compile(gx2vk::ResolvedCompileJob<T>& job) {
+    return job.get([](const auto& pending){return await_compile(pending);});
+}
 struct Program {
     uint32_t id = 0;
     std::array<R700TranslationInfo, 2> info;
@@ -572,10 +596,12 @@ struct Program {
     uint32_t rect = 0;               // 0 none, 1 RECT, 2 QUADS/QUAD_STRIP
     bool points = false;
     VkShaderModule vs = VK_NULL_HANDLE, gs = VK_NULL_HANDLE;
-    gx2vk::CompileQueue::Job<bool> compiled;
+    gx2vk::ResolvedCompileJob<bool> compiled;
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     bool push = false;
     std::vector<VkDescriptorSetLayoutBinding> bindings;
+    std::vector<uint32_t> dynamic_uniform_bindings; // sorted Vulkan dynamic-offset order
+    std::vector<uint8_t> attribute_semantics; // immutable ascending live semantics
     VkPipelineLayout layout = VK_NULL_HANDLE;
     bool valid = false;
     std::string ufblock_cache[2];      // last uploaded uniform-variable block per stage
@@ -592,6 +618,14 @@ uint32_t s_frame_draw_index = 0;
 VkDescriptorPool s_descriptor_pool = VK_NULL_HANDLE;   // fallback when a set exceeds the push limit
 uint64_t s_descriptor_pool_serial = 0;
 std::vector<std::pair<uint64_t, VkDescriptorPool>> s_retired_pools;
+std::vector<VkDescriptorPool> s_free_descriptor_pools;
+// Exact identities are valid only within one recording serial. Destruction of
+// buffers/views is deferred through that serial, so recycled handles can never
+// make an old entry appear to describe a new resource. Pools are reset only
+// after their last serial has completed. No cache or memory usage cap is added.
+uint64_t s_descriptor_cache_serial = 0;
+std::unordered_map<std::string,VkDescriptorSet> s_descriptor_sets;
+std::string s_descriptor_key;
 
 GX2ShaderProgram active_shader_program(uint8_t* mem, bool pixel) {
     if (pixel ? S.ps_from_regs : S.vs_from_regs) {
@@ -672,8 +706,11 @@ void trace_program_key_miss(uint32_t vs, uint32_t ps, bool reused) {
 #endif
 }
 
-bool create_program_layouts(Program& p) {
+bool create_program_layouts(Program& p, bool allow_push = true) {
     const auto& caps = gx2vk::caps();
+    p.attribute_semantics.clear();
+    for(unsigned semantic=0;semantic<p.info[0].attribute_locations.size();++semantic)
+        if(p.info[0].attribute_locations[semantic]>=0)p.attribute_semantics.push_back(uint8_t(semantic));
     // One descriptor set (set 0) holds both stages: the emitter's native
     // Vulkan mode gives each stage its own binding range.
     auto& bindings = p.bindings;
@@ -690,7 +727,19 @@ bool create_program_layouts(Program& p) {
             if (vk.texture_bindings[t] >= 0)
                 bindings.push_back({uint32_t(vk.texture_bindings[t]), VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, flags, nullptr});
     }
-    p.push = caps.push_descriptor && bindings.size() <= caps.max_push_descriptors;
+    p.push = allow_push && caps.push_descriptor && bindings.size() <= caps.max_push_descriptors;
+    // Like Cemu's Vulkan uniform streaming, separate changing ring offsets
+    // from descriptor identity. Push descriptors cannot be dynamic; ordinary
+    // sets use as many dynamic UBO bindings as this device actually supports.
+    p.dynamic_uniform_bindings.clear();
+    if(!p.push) {
+        for(auto& binding:bindings)if(binding.descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+                p.dynamic_uniform_bindings.size()<caps.limits.maxDescriptorSetUniformBuffersDynamic) {
+            binding.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+            p.dynamic_uniform_bindings.push_back(binding.binding);
+        }
+        std::sort(p.dynamic_uniform_bindings.begin(),p.dynamic_uniform_bindings.end());
+    }
     VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     info.flags = p.push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0;
     info.bindingCount = uint32_t(bindings.size());
@@ -1929,7 +1978,8 @@ struct PipelineKeyHash {
     using is_transparent=void;
     size_t operator()(std::string_view key) const noexcept { return std::hash<std::string_view>{}(key); }
 };
-std::unordered_map<std::string, gx2vk::CompileQueue::Job<VkPipeline>,PipelineKeyHash,std::equal_to<>> s_pipelines;
+using PipelineJob=gx2vk::ResolvedCompileJob<VkPipeline>;
+std::unordered_map<std::string,PipelineJob,PipelineKeyHash,std::equal_to<>> s_pipelines;
 
 VkBlendFactor vk_blend(uint32_t f) {
     switch (f) {
@@ -1987,6 +2037,7 @@ struct PipelineKey {
     size_t size=0;
     std::string_view view() const { return {bytes.data(),size}; }
 };
+gx2vk::LastLookup<PipelineKey::kCapacity,PipelineJob> s_last_pipeline_lookup;
 PipelineKey pipeline_key(const PipelineRequest& r, const PipelineSwitches& s) {
     PipelineKey key{};
     auto put = [&](const void* p, size_t n) { std::memcpy(key.bytes.data()+key.size,p,n);key.size+=n; };
@@ -2005,13 +2056,20 @@ void warm_record_pipeline(const PipelineRequest& r, const PipelineSwitches& s);
 VkPipeline get_pipeline(const PipelineRequest& r) {
     const PipelineSwitches s = pipeline_switches(*r.program);
     const auto key=pipeline_key(r,s);
-    const auto found=s_pipelines.find(key.view());
-    if(found!=s_pipelines.end())return await_compile(found->second);
-    (void)gx2vk::pipeline_cache();
-    auto [inserted,added]=s_pipelines.emplace(std::string(key.view()),post_compile([r,s]{return create_pipeline(r,s);}));
-    ++C.pipelines;
-    if(!r.xfb)warm_record_pipeline(r,s);
-    return await_compile(inserted->second);
+    auto* entry=s_last_pipeline_lookup.find(key.view());
+    if(!entry) {
+        const auto found=s_pipelines.find(key.view());
+        if(found!=s_pipelines.end())entry=&found->second;
+        else {
+            (void)gx2vk::pipeline_cache();
+            auto [inserted,added]=s_pipelines.emplace(std::string(key.view()),post_compile([r,s]{return create_pipeline(r,s);}));
+            entry=&inserted->second;
+            ++C.pipelines;
+            if(!r.xfb)warm_record_pipeline(r,s);
+        }
+        s_last_pipeline_lookup.remember(key.view(),entry);
+    }
+    return await_compile(*entry);
 }
 
 // Thread-safe for non-xfb requests: Vulkan objects only (the boot warm-up
@@ -2502,6 +2560,7 @@ BufferRef cached_vertex_buffer(uint8_t* mem, uint32_t addr, uint32_t size,uint64
     }
     if (!b.buffer.buffer || !b.buffer.memory.mapped) { b.valid = false; return {}; }
     std::memcpy(b.buffer.memory.mapped, mem + addr, size);
+    if (!gx2vk::flush_mapped(b.buffer.memory, 0, size)) { b.valid = false; return {}; }
     b.valid = true; b.mem = mem; b.written = written; b.last_serial = gx2vk::recording_serial();
     return {b.buffer.buffer, 0, size};
 }
@@ -2579,7 +2638,7 @@ void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
     }
     // Every location the shader reads needs a binding in Vulkan; GPU supplies
     // the current generic attribute (0,0,0,1.0f) for disabled arrays.
-    for (unsigned semantic = 0; semantic < 256; ++semantic) {
+    for (const unsigned semantic : prog.attribute_semantics) {
         const int location = mapping[semantic];
         if (location < 0 || uint32_t(location) >= input_limit) continue;
         auto& a = out.input.attrs[out.input.count];
@@ -2594,7 +2653,12 @@ void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
             if (!s_null_vertex.buffer) {
                 s_null_vertex = gx2vk::create_buffer(16, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, gx2vk::MemoryUse::Upload);
                 const uint32_t words[4] = {0, 0, 0, 0x3F800000u};
+                if (!s_null_vertex.memory.mapped) return;
                 std::memcpy(s_null_vertex.memory.mapped, words, 16);
+                if (!gx2vk::flush_mapped(s_null_vertex.memory, 0, 16)) {
+                    gx2vk::destroy_buffer(s_null_vertex);
+                    return;
+                }
             }
             a = {uint32_t(location), VK_FORMAT_R32G32B32A32_UINT, 0, 0, 1};
             buffer = s_null_vertex.buffer;
@@ -2819,9 +2883,9 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
     return true;
 }
 
-void bind_descriptors(VkCommandBuffer cb, Program& prog, VkWriteDescriptorSet* writes, uint32_t write_count) {
-    if (!write_count) { s_bindings.descriptor_layout = VK_NULL_HANDLE; return; }
-    if (same_descriptors(prog.layout, writes, write_count)) { TXDIAG(txdiag::count(txdiag::DescriptorHits));return; }
+bool bind_descriptors(VkCommandBuffer cb, Program& prog, VkWriteDescriptorSet* writes, uint32_t write_count) {
+    if (!write_count) { s_bindings.descriptor_layout = VK_NULL_HANDLE; return true; }
+    if (same_descriptors(prog.layout, writes, write_count)) { TXDIAG(txdiag::count(txdiag::DescriptorHits));return true; }
     TXDIAG(txdiag::count(txdiag::DescriptorUpdates));
 #ifdef RBREW_TEXTURE_DIAGNOSTICS
     const bool diagnostic_update=txdiag::sample("descriptor_update",prog.id);
@@ -2840,44 +2904,96 @@ void bind_descriptors(VkCommandBuffer cb, Program& prog, VkWriteDescriptorSet* w
         TXDIAG(diagnostic_descriptors(VK_NULL_HANDLE));
         vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, prog.layout, 0, write_count, writes);
         remember_descriptors(prog.layout, writes, write_count);
-        return;
+        return true;
     }
-    // Fallback for sets above maxPushDescriptors: per-submission pools.
-    if (!s_descriptor_pool || s_descriptor_pool_serial != gx2vk::recording_serial()) {
+    const uint64_t serial=gx2vk::recording_serial();
+    if(s_descriptor_cache_serial!=serial) {
+        s_descriptor_sets.clear();s_descriptor_cache_serial=serial;
         if (s_descriptor_pool) s_retired_pools.push_back({s_descriptor_pool_serial, s_descriptor_pool});
-        const uint64_t done = gx2vk::completed_serial();
+        s_descriptor_pool=VK_NULL_HANDLE;
+        // cmd() has already polled completion. A conservative cached value
+        // suffices here; pool allocation must never introduce another wait.
+        const uint64_t done = gx2vk::known_completed_serial();
         for (auto it = s_retired_pools.begin(); it != s_retired_pools.end();) {
             if (it->first <= done) {
-                TXDIAG(txdiag::event("descriptor_pool_destroy","\"pool\":%llu,\"last_serial\":%llu,\"gpu_completed\":%llu",txdiag::handle(it->second),it->first,done));
-                vkDestroyDescriptorPool(gx2vk::device(), it->second, nullptr); it = s_retired_pools.erase(it);
+                s_free_descriptor_pools.push_back(it->second);it=s_retired_pools.erase(it);
             }
             else ++it;
         }
-        const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096}};
-        VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        info.maxSets = 1024; info.poolSizeCount = 2; info.pPoolSizes = sizes;
-        vkCreateDescriptorPool(gx2vk::device(), &info, nullptr, &s_descriptor_pool);
-        TXDIAG(txdiag::event("descriptor_pool_create","\"id\":%llu,\"pool\":%llu",txdiag::next_id(),txdiag::handle(s_descriptor_pool)));
-        s_descriptor_pool_serial = gx2vk::recording_serial();
     }
-    VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    alloc.descriptorPool = s_descriptor_pool;
-    alloc.descriptorSetCount = 1;
-    alloc.pSetLayouts = &prog.set_layout;
+    // Serialize fields individually, never structure padding or host pointers.
+    // unordered_map checks complete key equality even on a hash collision.
+    auto& key=s_descriptor_key;key.clear();
+    std::array<uint32_t,StageDescriptors::kMaxBuffers*2> dynamic_offsets{};
+    std::array<bool,StageDescriptors::kMaxWrites*2> dynamic{};
+    auto append=[&](const auto& value){key.append(reinterpret_cast<const char*>(&value),sizeof(value));};
+    append(prog.set_layout);
+    for(uint32_t i=0;i<write_count;++i) {
+        const auto& w=writes[i];
+        if(w.pNext || w.dstArrayElement || w.descriptorCount!=1)return false;
+        append(w.dstBinding);append(w.descriptorType);
+        if(w.descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER){
+            const auto& b=*w.pBufferInfo;
+            const auto found=std::lower_bound(prog.dynamic_uniform_bindings.begin(),prog.dynamic_uniform_bindings.end(),w.dstBinding);
+            dynamic[i]=found!=prog.dynamic_uniform_bindings.end() && *found==w.dstBinding;
+            if(dynamic[i]) {
+                if(b.offset>UINT32_MAX)return false;
+                dynamic_offsets[size_t(found-prog.dynamic_uniform_bindings.begin())]=uint32_t(b.offset);
+            }
+            append(b.buffer);append(dynamic[i]?VkDeviceSize(0):b.offset);append(b.range);
+        }
+        else if(w.descriptorType==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER){const auto& b=*w.pImageInfo;append(b.sampler);append(b.imageView);append(b.imageLayout);}
+        else return false;
+    }
     VkDescriptorSet set = VK_NULL_HANDLE;
-    if (vkAllocateDescriptorSets(gx2vk::device(), &alloc, &set) != VK_SUCCESS) {
-        TXDIAG(txdiag::event("descriptor_allocation_failed","\"pool\":%llu,\"program\":%u",txdiag::handle(s_descriptor_pool),prog.id));
-        // Pool exhausted within one submission: start another.
-        s_retired_pools.push_back({s_descriptor_pool_serial, s_descriptor_pool});
-        s_descriptor_pool = VK_NULL_HANDLE;
-        bind_descriptors(cb, prog, writes, write_count);
-        return;
+    if(const auto found=s_descriptor_sets.find(key);found!=s_descriptor_sets.end())set=found->second;
+    else {
+        // Retry only pool exhaustion/fragmentation, once with an empty pool.
+        // Device/host OOM and device loss must not recurse or allocate forever.
+        bool empty=false;
+        for(unsigned attempt=0;attempt<2;++attempt) {
+            if(!s_descriptor_pool) {
+                if(!s_free_descriptor_pools.empty()) {
+                    s_descriptor_pool=s_free_descriptor_pools.back();s_free_descriptor_pools.pop_back();
+                    if(vkResetDescriptorPool(gx2vk::device(),s_descriptor_pool,0)!=VK_SUCCESS) {
+                        vkDestroyDescriptorPool(gx2vk::device(),s_descriptor_pool,nullptr);s_descriptor_pool=VK_NULL_HANDLE;return false;
+                    }
+                } else {
+                    const VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,4096},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,4096},{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,4096}};
+                    VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+                    info.maxSets=1024;info.poolSizeCount=3;info.pPoolSizes=sizes;
+                    if(vkCreateDescriptorPool(gx2vk::device(),&info,nullptr,&s_descriptor_pool)!=VK_SUCCESS)return false;
+                    TXDIAG(txdiag::event("descriptor_pool_create","\"id\":%llu,\"pool\":%llu",txdiag::next_id(),txdiag::handle(s_descriptor_pool)));
+                }
+                s_descriptor_pool_serial=serial;empty=true;
+            }
+            VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            alloc.descriptorPool=s_descriptor_pool;alloc.descriptorSetCount=1;alloc.pSetLayouts=&prog.set_layout;
+            const VkResult result=vkAllocateDescriptorSets(gx2vk::device(),&alloc,&set);
+            if(result==VK_SUCCESS)break;
+            if(result!=VK_ERROR_OUT_OF_POOL_MEMORY && result!=VK_ERROR_FRAGMENTED_POOL)return false;
+            s_retired_pools.push_back({s_descriptor_pool_serial,s_descriptor_pool});s_descriptor_pool=VK_NULL_HANDLE;
+            if(empty)return false; // every supported layout fits an empty pool
+        }
+        if(!set)return false;
+        std::array<VkWriteDescriptorSet,StageDescriptors::kMaxWrites*2> updates;
+        std::array<VkDescriptorBufferInfo,StageDescriptors::kMaxBuffers*2> buffers;
+        uint32_t buffer_count=0;
+        for(uint32_t i=0;i<write_count;++i) {
+            updates[i]=writes[i];updates[i].dstSet=set;
+            if(dynamic[i]) {
+                buffers[buffer_count]=*writes[i].pBufferInfo;buffers[buffer_count].offset=0;
+                updates[i].pBufferInfo=&buffers[buffer_count++];updates[i].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+            }
+        }
+        TXDIAG(diagnostic_descriptors(set));
+        vkUpdateDescriptorSets(gx2vk::device(),write_count,updates.data(),0,nullptr);
+        s_descriptor_sets.emplace(key,set);
     }
-    for (uint32_t i = 0; i < write_count; ++i) writes[i].dstSet = set;
-    TXDIAG(diagnostic_descriptors(set));
-    vkUpdateDescriptorSets(gx2vk::device(), write_count, writes, 0, nullptr);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, prog.layout, 0, 1, &set, 0, nullptr);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, prog.layout, 0, 1, &set,
+        uint32_t(prog.dynamic_uniform_bindings.size()),dynamic_offsets.data());
     remember_descriptors(prog.layout, writes, write_count);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -3111,6 +3227,7 @@ struct GuestStreamOut {
             // the entire guest allocation here wastes bandwidth and cannot
             // contribute to those GPU-written words or preserved holes.
             std::memcpy(counter[i].memory.mapped,&offsets[i],4);
+            if(!gx2vk::flush_mapped(counter[i].memory,0,4))return false;
             counters[i]=counter[i].buffer;
         }
         return true;
@@ -3149,6 +3266,7 @@ struct GuestStreamOut {
             fragments=uint32_t(passed);
         }
         for(unsigned i=0;i<count;++i)if(mask&(1u<<i)) {
+            if(!gx2vk::invalidate_mapped(counter[i].memory) || !gx2vk::invalidate_mapped(data[i].memory))return false;
             uint32_t written;std::memcpy(&written,counter[i].memory.mapped,4);
             if(written<offsets[i] || written>data[i].size) {
                 RBREW_LOGF(stderr,"[gx2] stream-out counter outside buffer %u: %u\n",i,written);return false;
@@ -3190,10 +3308,9 @@ static bool trace_skip(const char* reason) {
 // only, which is how a light-space shadow pass shows up without a trace.
 static uint32_t s_shadow_depth_only_draws, s_shadow_color_draws, s_shadow_frames_logged;
 
-bool issue_draw(uint8_t* mem, uint32_t prim, uint32_t count, uint32_t first_vertex, const IndexStream& indices, bool xfb,
+bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t count, uint32_t first_vertex, const IndexStream& indices, bool xfb,
                 void (*hook)(bool, VkCommandBuffer)) {
     TXDIAG(txdiag::count(txdiag::Draws));
-    Program* prog = resolve_active_program(mem);
     if (!prog) return trace_skip("no-program");
     s_last_program = prog->id;
     TXDIAG(if(txdiag::sample("raster_state",uint64_t(prog->id)<<32|S.current_fbo_id))
@@ -3253,6 +3370,7 @@ bool issue_draw(uint8_t* mem, uint32_t prim, uint32_t count, uint32_t first_vert
     if (s_dynamic_serial != gx2vk::recording_serial()) reset_command_tracking();
     const bool restart = indices.indexed && indices.restart;
     if (!apply_dynamic_state(cb, topology, restart)) return trace_skip("dynamic-state");
+    uint64_t applied_epoch=s_tracking_epoch;
     frame_trace_draw(*prog);
     const unsigned mode = prim & 31;
     const uint32_t loops = S.draw_first_instance ? S.draw_instances : 1;
@@ -3277,13 +3395,16 @@ bool issue_draw(uint8_t* mem, uint32_t prim, uint32_t count, uint32_t first_vert
         // are recorded).
         cb = gx2vk::cmd();
         if (s_dynamic_serial != gx2vk::recording_serial()) reset_command_tracking();
-        if (!apply_dynamic_state(cb, topology, restart)) return any;
+        // Packing descriptors does not change guest raster state. Revalidate
+        // only if an upload/readback/internal pass invalidated command state.
+        if (applied_epoch!=s_tracking_epoch && !apply_dynamic_state(cb, topology, restart)) return any;
+        applied_epoch=s_tracking_epoch;
         if (pipeline != s_bound_pipeline) { vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline); s_bound_pipeline = pipeline; }
         std::array<VkWriteDescriptorSet, StageDescriptors::kMaxWrites * 2> writes;
         const uint32_t write_count = sd[0].write_count + sd[1].write_count;
         std::copy_n(sd[0].writes.data(), sd[0].write_count, writes.data());
         std::copy_n(sd[1].writes.data(), sd[1].write_count, writes.data() + sd[0].write_count);
-        bind_descriptors(cb, *prog, writes.data(), write_count);
+        if(!bind_descriptors(cb, *prog, writes.data(), write_count))return any;
         const int32_t base_instance = int32_t(S.instance_uniform);
         bind_instance(cb, prog->layout, base_instance);
         bind_vertices(cb, vb.input.count, vb.buffers, vb.offsets);
@@ -3294,7 +3415,7 @@ bool issue_draw(uint8_t* mem, uint32_t prim, uint32_t count, uint32_t first_vert
         if (hook) hook(true, cb);
         streamout.begin(cb);
         if (indices.indexed) {
-            vkCmdBindIndexBuffer(cb, indices.span.buffer, indices.span.offset, indices.type);
+            bind_indices(cb, indices.span.buffer, indices.span.offset, indices.type);
             vkCmdDrawIndexed(cb, indices.count, instances, 0, int32_t(first_vertex), 0);
         } else {
             vkCmdDraw(cb, count, instances, first_vertex, 0);
@@ -3331,6 +3452,11 @@ bool issue_draw(uint8_t* mem, uint32_t prim, uint32_t count, uint32_t first_vert
     }
     (void)mode;
     return any;
+}
+
+bool issue_draw(uint8_t* mem, uint32_t prim, uint32_t count, uint32_t first_vertex, const IndexStream& indices, bool xfb,
+                void (*hook)(bool, VkCommandBuffer)) {
+    return issue_draw_program(resolve_active_program(mem), mem, prim, count, first_vertex, indices, xfb, hook);
 }
 
 void (*s_xfb_hook)(bool, VkCommandBuffer) = nullptr;
@@ -3817,6 +3943,55 @@ void gx2_render_vk_startup_warmup(void (*progress)(double)) {
     s_warm_progress = nullptr;
 }
 
+#ifdef RBREW_ADVANCED_TESTS
+#include "../../../tests/render_stress.inl"
+// Authored, guest-free GPU probe of the production pipeline lookup path.
+bool gx2_render_vk_test_pipeline_cache() {
+    Program program;
+    program.id=UINT32_MAX;
+    program.vs=gx2vk::shader_module(VK_SHADER_STAGE_VERTEX_BIT,
+        "#version 450\nvoid main(){gl_Position=vec4(0.0,0.0,0.0,1.0);}\n");
+    program.ps_source="#version 450\nlayout(location=0)out vec4 c;void main(){c=vec4(1.0);}\n";
+    VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    if(!program.vs || vkCreatePipelineLayout(gx2vk::device(),&layout,nullptr,&program.layout)!=VK_SUCCESS)return false;
+    struct Cleanup {
+        Program& program;
+        ~Cleanup(){
+            s_last_pipeline_lookup.reset();
+            for(auto it=s_pipelines.begin();it!=s_pipelines.end();) {
+                uint32_t id=0;std::memcpy(&id,it->first.data(),sizeof(id));
+                if(id!=program.id){++it;continue;}
+                if(auto pipe=await_compile(it->second))vkDestroyPipeline(gx2vk::device(),pipe,nullptr);
+                it=s_pipelines.erase(it);
+            }
+            vkDestroyPipelineLayout(gx2vk::device(),program.layout,nullptr);
+        }
+    } cleanup{program};
+    PipelineRequest request{};
+    request.program=&program;request.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    request.colors[0]=VK_FORMAT_R8G8B8A8_UNORM;
+    request.blend[0].colorWriteMask=0xf;
+    const auto before=C.pipelines;
+    const auto first=get_pipeline(request);
+    if(!first)return false;
+    for(unsigned i=0;i<1000;++i)if(get_pipeline(request)!=first)return false;
+    if(C.pipelines!=before+1)return false;
+    request.blend[0].colorWriteMask=1;
+    const auto second=get_pipeline(request);
+    if(!second || second==first)return false;
+    // A queued warm-up pipeline must be reused/promoted, never duplicated.
+    request.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    const auto switches=pipeline_switches(program);
+    const auto key=pipeline_key(request,switches);
+    s_pipelines.emplace(std::string(key.view()),post_compile([request,switches]{return create_pipeline(request,switches);},true));
+    const auto before_warm=C.pipelines;
+    const auto third=get_pipeline(request);
+    if(!third || third==second || C.pipelines!=before_warm)return false;
+    request.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;request.blend[0].colorWriteMask=0xf;
+    return get_pipeline(request)==first;
+}
+#endif
+
 #ifdef RBREW_GX2_QUEUE_TESTS
 // One synchronous loading pass over `dir` into a private preload: entry bytes
 // by key and {on_disk, from_pack, read, stale, complete, pack_written}.
@@ -3879,8 +4054,9 @@ void gx2r::shutdown_draw_state() {
     s_query_pools.clear(); s_free_queries.clear(); s_deferred_free_queries.clear();
     s_query_active = s_trace_query_open = false;
     s_trace_query = UINT32_MAX;
+    s_last_pipeline_lookup.reset();
     for (auto& [key, job] : s_pipelines) {
-        try { if (auto pipeline = job.result.get()) vkDestroyPipeline(device, pipeline, nullptr); } catch (...) {}
+        try { if (auto pipeline = await_compile(job)) vkDestroyPipeline(device, pipeline, nullptr); } catch (...) {}
     }
     s_pipelines.clear();
     for (auto& [key, program] : s_prog_by_source) {
@@ -3897,12 +4073,15 @@ void gx2r::shutdown_draw_state() {
     s_transfer_layout = VK_NULL_HANDLE; s_transfer_set = VK_NULL_HANDLE;
     if (s_descriptor_pool) vkDestroyDescriptorPool(device, s_descriptor_pool, nullptr);
     for (auto& [serial, pool] : s_retired_pools) vkDestroyDescriptorPool(device, pool, nullptr);
+    for(auto pool:s_free_descriptor_pools)vkDestroyDescriptorPool(device,pool,nullptr);
+    s_free_descriptor_pools.clear();s_descriptor_sets.clear();s_descriptor_key.clear();s_descriptor_cache_serial=0;
     s_descriptor_pool = VK_NULL_HANDLE; s_descriptor_pool_serial = 0; s_retired_pools.clear();
     for (auto& [key, buffer] : s_vertex_buffers) gx2vk::destroy_buffer(buffer.buffer);
     s_vertex_buffers.clear(); s_vertex_bytes = 0; s_vertex_evict_bucket = 0; s_vertex_stale.clear();
     s_index_spans.clear(); s_index_chunk = 0;
     gx2vk::destroy_buffer(s_null_vertex);
     s_zero_ubo = {};
+    s_last_sampler={};
     for (auto& [key, dummy] : s_dummies) gx2vk::destroy_image(dummy.image);
     s_dummies.clear();
     for (auto& [source, copy] : s_shadow_copies) { gx2vk::destroy_image(copy.image); gx2vk::destroy_buffer(copy.staging); }

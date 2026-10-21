@@ -1,6 +1,7 @@
 #include "../../../runtime/rbrew_diagnostics.h"
 #include "../../../runtime/texture_diagnostics.h"
 #include "gx2_vk.h"
+#include "gx2_vk_memory.h"
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <SDL_vulkan.h>
@@ -86,53 +87,48 @@ struct Block {
     uint8_t* mapped = nullptr;
     std::map<VkDeviceSize, VkDeviceSize> free;   // offset -> size
     VkDeviceSize used = 0;
+    VkDeviceSize size = 0;
 };
-struct Pool { uint32_t type = 0; bool linear = false; std::vector<Block> blocks; };
+struct Pool { uint32_t type = 0; bool linear = false, mapped = false; std::vector<Block> blocks; };
 std::vector<Pool> s_pools;
 uint64_t s_allocated = 0;
 std::array<uint64_t, VK_MAX_MEMORY_TYPES> s_allocated_by_type{};
 
-int find_memory_type(uint32_t bits, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred) {
-    int fallback = -1;
-    for (uint32_t i = 0; i < s_memory.memoryTypeCount; ++i) {
-        if (!(bits & (1u << i))) continue;
-        const auto flags = s_memory.memoryTypes[i].propertyFlags;
-        if ((flags & required) != required) continue;
-        if ((flags & preferred) == preferred) return int(i);
-        if (fallback < 0) fallback = int(i);
-    }
-    return fallback;
-}
-
-uint32_t pool_index(uint32_t type, bool linear) {
+uint32_t pool_index(uint32_t type, bool linear, bool mapped) {
     for (uint32_t i = 0; i < s_pools.size(); ++i)
-        if (s_pools[i].type == type && s_pools[i].linear == linear) return i;
-    s_pools.push_back({type, linear, {}});
+        if (s_pools[i].type == type && s_pools[i].linear == linear && s_pools[i].mapped == mapped) return i;
+    s_pools.push_back({type, linear, mapped, {}});
     return uint32_t(s_pools.size() - 1);
 }
 
-bool type_host_visible(uint32_t type) {
-    return s_memory.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+bool retry_memory(VkResult result) {
+    return result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_MEMORY_MAP_FAILED;
 }
 
-VkDeviceMemory raw_allocate(VkDeviceSize size, uint32_t type, uint8_t** mapped) {
+VkResult raw_allocate(VkDeviceSize size, uint32_t type, bool map,
+                      const VkMemoryDedicatedAllocateInfo* dedicated, VkDeviceMemory& memory, uint8_t*& mapped) {
     VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    info.pNext = dedicated;
     info.allocationSize = size;
     info.memoryTypeIndex = type;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    if (vkAllocateMemory(s_device, &info, nullptr, &memory) != VK_SUCCESS) return VK_NULL_HANDLE;
-    *mapped = nullptr;
-    if (type_host_visible(type)) {
+    memory = VK_NULL_HANDLE;
+    mapped = nullptr;
+    VkResult result = vkAllocateMemory(s_device, &info, nullptr, &memory);
+    if (result != VK_SUCCESS) return result;
+    // GPU-only resources do not need a mapping, even on a host-visible UMA type.
+    if (map) {
         void* p = nullptr;
-        if (vkMapMemory(s_device, memory, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) {
+        result = vkMapMemory(s_device, memory, 0, VK_WHOLE_SIZE, 0, &p);
+        if (result != VK_SUCCESS) {
             vkFreeMemory(s_device, memory, nullptr);
-            return VK_NULL_HANDLE;
+            memory = VK_NULL_HANDLE;
+            return result;
         }
-        *mapped = static_cast<uint8_t*>(p);
+        mapped = static_cast<uint8_t*>(p);
     }
     s_allocated += size;
     s_allocated_by_type[type] += size;
-    return memory;
+    return VK_SUCCESS;
 }
 
 bool block_allocate(Block& block, VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& out) {
@@ -198,7 +194,11 @@ uint64_t s_barriers = 0;
 void poll_completed() {
     if (!s_timeline) return;
     uint64_t value = 0;
-    if (vkGetSemaphoreCounterValue(s_device, s_timeline, &value) == VK_SUCCESS) s_completed = std::max(s_completed, value);
+    // With no outstanding tracked submission, the driver cannot tell us
+    // anything new. Still drain deferred callbacks below: callers may have
+    // scheduled CPU cleanup since the last completion was observed.
+    if (s_completed < s_next_serial - 1 && vkGetSemaphoreCounterValue(s_device, s_timeline, &value) == VK_SUCCESS)
+        s_completed = std::max(s_completed, value);
     while (!s_deferred.empty() && s_deferred.front().serial <= s_completed) {
         auto f = std::move(s_deferred.front().f);
         s_deferred.pop_front();
@@ -225,6 +225,20 @@ std::vector<Chunk> s_chunks;
 int s_active_chunk = -1;
 uint64_t s_chunk_ids = 0;
 std::vector<uint64_t> s_live_chunk_ids;
+// Only non-coherent uploads enter this list. Merge adjacent spans in a chunk.
+std::vector<VkMappedMemoryRange> s_upload_flushes;
+void queue_upload_flush(const Allocation& a, VkDeviceSize offset, VkDeviceSize bytes) {
+    if (a.properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) return;
+    auto range = memory_detail::mapped_range(a, s_caps.limits.nonCoherentAtomSize, offset, bytes);
+    if (!s_upload_flushes.empty()) {
+        auto& last = s_upload_flushes.back();
+        if (last.memory == range.memory && last.offset + last.size == range.offset) {
+            last.size += range.size;
+            return;
+        }
+    }
+    s_upload_flushes.push_back(range);
+}
 
 // ---------------------------------------------------------------------------
 // Swapchain
@@ -1131,6 +1145,7 @@ void shutdown() {
         free_now(chunk.buffer.memory);
     }
     s_chunks.clear();
+    s_upload_flushes.clear();
     s_active_chunk = -1;
     s_live_chunk_ids.clear();
     destroy_swapchain_objects(false);
@@ -1172,66 +1187,94 @@ std::string last_validation_error() { std::lock_guard lock(s_validation_mutex); 
 // ---------------------------------------------------------------------------
 // Memory
 // ---------------------------------------------------------------------------
-Allocation allocate(const VkMemoryRequirements& requirements, MemoryUse use, bool linear) {
-    VkMemoryPropertyFlags required = 0, preferred = 0;
-    switch (use) {
-    case MemoryUse::DeviceLocal: required = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT; break;
-    case MemoryUse::Upload:
-        required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        preferred = required | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-        break;
-    case MemoryUse::Readback:
-        required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        preferred = required | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-        break;
-    }
-    int type = find_memory_type(requirements.memoryTypeBits, required, preferred | required);
-    // A device-local upload heap is only worth it when it is large (ReBAR);
-    // a 256 MiB BAR window would be exhausted by streamed geometry.
-    if (use == MemoryUse::Upload && type >= 0 &&
-        (s_memory.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
-        s_memory.memoryHeaps[s_memory.memoryTypes[type].heapIndex].size < (1ull << 30))
-        type = find_memory_type(requirements.memoryTypeBits, required, required);
-    if (type < 0) return {};
-    Allocation a;
-    a.size = requirements.size;
-    if (requirements.size >= kDedicatedThreshold) {
-        uint8_t* mapped = nullptr;
-        a.memory = raw_allocate(requirements.size, uint32_t(type), &mapped);
-        a.mapped = mapped;
-        a.block = -1;
-        a.pool = uint32_t(type);
-        return a.memory ? a : Allocation{};
-    }
-    const uint32_t p = pool_index(uint32_t(type), linear);
-    auto& pool = s_pools[p];
-    const VkDeviceSize alignment = std::max<VkDeviceSize>(requirements.alignment, 16);
-    for (uint32_t b = 0; b < pool.blocks.size(); ++b) {
-        auto& block = pool.blocks[b];
-        if (!block.memory) continue;
-        VkDeviceSize offset = 0;
-        if (block_allocate(block, requirements.size, alignment, offset)) {
-            a.memory = block.memory; a.offset = offset; a.block = int32_t(b); a.pool = p;
-            a.mapped = block.mapped ? block.mapped + offset : nullptr;
-            return a;
+Allocation allocate(const VkMemoryRequirements& requirements, MemoryUse use, bool linear,
+                    const VkMemoryDedicatedAllocateInfo* dedicated) {
+    if (!requirements.size) return {};
+    const auto types = memory_detail::memory_types(s_memory, requirements.memoryTypeBits, use);
+    const bool mapped = use != MemoryUse::DeviceLocal;
+    for (uint32_t candidate = 0; candidate < types.count; ++candidate) {
+        const uint32_t type = types.indices[candidate];
+        const auto& memory_type = s_memory.memoryTypes[type];
+        if (requirements.size > s_memory.memoryHeaps[memory_type.heapIndex].size) continue;
+        Allocation a;
+        a.size = requirements.size;
+        a.memory_type = type;
+        a.properties = memory_type.propertyFlags;
+        if (dedicated || requirements.size >= kDedicatedThreshold) {
+            a.pool = type;
+            a.backing_size = a.size;
+            const auto result = raw_allocate(a.size, type, mapped, dedicated, a.memory, a.mapped);
+            if (result == VK_SUCCESS) return a;
+            if (!retry_memory(result)) return {};
+            continue;
         }
+        const bool noncoherent = mapped && !(a.properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        const VkDeviceSize atom = noncoherent ? s_caps.limits.nonCoherentAtomSize : 1;
+        const VkDeviceSize alignment = std::max({requirements.alignment, VkDeviceSize(16), atom});
+        a.size = memory_detail::align_up(requirements.size, atom);
+        const uint32_t p = pool_index(type, linear, mapped);
+        auto& pool = s_pools[p];
+        for (uint32_t b = 0; b < pool.blocks.size(); ++b) {
+            auto& block = pool.blocks[b];
+            if (!block.memory) continue;
+            VkDeviceSize offset = 0;
+            if (block_allocate(block, a.size, alignment, offset)) {
+                a.memory = block.memory; a.offset = offset; a.block = int32_t(b); a.pool = p;
+                a.backing_size = block.size;
+                a.mapped = block.mapped ? block.mapped + offset : nullptr;
+                return a;
+            }
+        }
+        Block block;
+        block.size = std::min(kBlockSize, s_memory.memoryHeaps[memory_type.heapIndex].size);
+        auto result = a.size <= block.size ? raw_allocate(block.size, type, mapped, nullptr, block.memory, block.mapped)
+                                          : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        if (result != VK_SUCCESS) {
+            if (!retry_memory(result)) return {};
+            // A pool block may not fit even though the resource still fits in
+            // this faster heap. Try its exact size before moving to another type.
+            a.size = requirements.size; a.pool = type; a.backing_size = a.size;
+            result = raw_allocate(a.size, type, mapped, nullptr, a.memory, a.mapped);
+            if (result == VK_SUCCESS) return a;
+            if (!retry_memory(result)) return {};
+            continue;
+        }
+        block.free[0] = block.size;
+        // Preserve stable indices while reusing vacant block slots.
+        uint32_t index = 0;
+        while (index < pool.blocks.size() && pool.blocks[index].memory) ++index;
+        if (index == pool.blocks.size()) pool.blocks.push_back(std::move(block));
+        else pool.blocks[index] = std::move(block);
+        auto& added = pool.blocks[index];
+        VkDeviceSize offset = 0;
+        block_allocate(added, a.size, alignment, offset);
+        a.memory = added.memory; a.offset = offset; a.block = int32_t(index); a.pool = p;
+        a.backing_size = added.size;
+        a.mapped = added.mapped ? added.mapped + offset : nullptr;
+        return a;
     }
-    Block block;
-    block.memory = raw_allocate(kBlockSize, uint32_t(type), &block.mapped);
-    if (!block.memory) return {};
-    block.free[0] = kBlockSize;
-    // Allocation handles contain block indices. Reuse vacant slots without
-    // moving live blocks or accumulating metadata after transient peaks.
-    uint32_t index = 0;
-    while (index < pool.blocks.size() && pool.blocks[index].memory) ++index;
-    if (index == pool.blocks.size()) pool.blocks.push_back(std::move(block));
-    else pool.blocks[index] = std::move(block);
-    auto& added = pool.blocks[index];
-    VkDeviceSize offset = 0;
-    block_allocate(added, requirements.size, alignment, offset);
-    a.memory = added.memory; a.offset = offset; a.block = int32_t(index); a.pool = p;
-    a.mapped = added.mapped ? added.mapped + offset : nullptr;
-    return a;
+    return {};
+}
+
+const VkPhysicalDeviceMemoryProperties& memory_properties() { return s_memory; }
+
+namespace {
+bool sync_mapped(const Allocation& a, VkDeviceSize offset, VkDeviceSize bytes, bool invalidate) {
+    if (!a.mapped || offset > a.size) return false;
+    if (a.properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) return true;
+    if (!bytes || offset == a.size) return true;
+    const auto range = memory_detail::mapped_range(a, s_caps.limits.nonCoherentAtomSize, offset, bytes);
+    const auto result = invalidate ? vkInvalidateMappedMemoryRanges(s_device, 1, &range)
+                                   : vkFlushMappedMemoryRanges(s_device, 1, &range);
+    if (result != VK_SUCCESS) RBREW_LOGF(stderr, "[vk] mapped memory synchronization failed (%d)\n", int(result));
+    return result == VK_SUCCESS;
+}
+}
+bool flush_mapped(const Allocation& a, VkDeviceSize offset, VkDeviceSize bytes) {
+    return sync_mapped(a, offset, bytes, false);
+}
+bool invalidate_mapped(const Allocation& a, VkDeviceSize offset, VkDeviceSize bytes) {
+    return sync_mapped(a, offset, bytes, true);
 }
 
 void free_now(Allocation& a) {
@@ -1251,8 +1294,8 @@ void free_now(Allocation& a) {
                 return &other != &block && other.memory && !other.used;
             })) {
             vkFreeMemory(s_device, block.memory, nullptr);
-            s_allocated -= kBlockSize;
-            s_allocated_by_type[s_pools[a.pool].type] -= kBlockSize;
+            s_allocated -= block.size;
+            s_allocated_by_type[s_pools[a.pool].type] -= block.size;
             block = {};
         }
     }
@@ -1369,6 +1412,11 @@ uint64_t submit_with(const VkSemaphore* wait, VkPipelineStageFlags2 wait_stage, 
     submit.pSignalSemaphoreInfos = signals;
     submit.waitSemaphoreInfoCount = wait ? 1 : 0;
     submit.pWaitSemaphoreInfos = &wait_info;
+    if (!s_upload_flushes.empty()) {
+        const auto flushed = vkFlushMappedMemoryRanges(s_device, uint32_t(s_upload_flushes.size()), s_upload_flushes.data());
+        if (flushed != VK_SUCCESS) RBREW_LOGF(stderr, "[vk] upload flush failed (%d)\n", int(flushed));
+        s_upload_flushes.clear();
+    }
     const VkResult result = vkQueueSubmit2(s_queue, 1, &submit, VK_NULL_HANDLE);
     TXDIAG(txdiag::count(txdiag::Submissions);txdiag::journal().serial=s_next_serial;txdiag::journal().completed=s_completed;
         if(result!=VK_SUCCESS || txdiag::sample("submit",0))txdiag::event("submit","\"submitted\":%llu,\"command_buffers\":%u,\"result\":%d",serial,cb_count,int(result)));
@@ -1453,6 +1501,7 @@ Span upload(VkDeviceSize bytes, VkDeviceSize alignment) {
             MemoryUse::Upload);
         if (!buffer.buffer || !buffer.memory.mapped) return {};
         Span span{buffer.buffer, 0, bytes, buffer.memory.mapped, 0};
+        queue_upload_flush(buffer.memory, 0, bytes);
         // This callback already runs after the consuming submission. Calling
         // destroy_buffer here would defer again to a future submission that
         // may never exist while the renderer is idle.
@@ -1465,10 +1514,13 @@ Span upload(VkDeviceSize bytes, VkDeviceSize alignment) {
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (s_active_chunk >= 0) {
             auto& chunk = s_chunks[s_active_chunk];
-            const VkDeviceSize start = (chunk.used + alignment - 1) / alignment * alignment;
+            const bool noncoherent = !(chunk.buffer.memory.properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            const VkDeviceSize atom = noncoherent ? s_caps.limits.nonCoherentAtomSize : 1;
+            const VkDeviceSize start = memory_detail::align_up(chunk.used, std::max(alignment, atom));
             if (start + bytes <= kChunkSize) {
-                chunk.used = start + bytes;
+                chunk.used = memory_detail::align_up(start + bytes, atom);
                 chunk.last_serial = s_next_serial;
+                queue_upload_flush(chunk.buffer.memory, start, bytes);
                 return {chunk.buffer.buffer, start, bytes, chunk.buffer.memory.mapped + start, chunk.id};
             }
             chunk.last_serial = s_next_serial;
@@ -1525,9 +1577,16 @@ Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, MemoryUse use)
     info.usage = usage;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (vkCreateBuffer(s_device, &info, nullptr, &b.buffer) != VK_SUCCESS) return {};
-    VkMemoryRequirements requirements{};
-    vkGetBufferMemoryRequirements(s_device, b.buffer, &requirements);
-    b.memory = allocate(requirements, use, true);
+    VkMemoryDedicatedRequirements dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+    VkMemoryRequirements2 requirements{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+    requirements.pNext = &dedicated;
+    VkBufferMemoryRequirementsInfo2 query{VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2};
+    query.buffer = b.buffer;
+    vkGetBufferMemoryRequirements2(s_device, &query, &requirements);
+    VkMemoryDedicatedAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    allocation.buffer = b.buffer;
+    b.memory = allocate(requirements.memoryRequirements, use, true,
+                        dedicated.requiresDedicatedAllocation || dedicated.prefersDedicatedAllocation ? &allocation : nullptr);
     if (!b.memory || vkBindBufferMemory(s_device, b.buffer, b.memory.memory, b.memory.offset) != VK_SUCCESS) {
         vkDestroyBuffer(s_device, b.buffer, nullptr);
         free_now(b.memory);
@@ -1624,9 +1683,16 @@ bool create_image(Image& image, const ImageDesc& desc) {
         image.image = VK_NULL_HANDLE;
         return false;
     }
-    VkMemoryRequirements requirements{};
-    vkGetImageMemoryRequirements(s_device, image.image, &requirements);
-    image.memory = allocate(requirements, MemoryUse::DeviceLocal, false);
+    VkMemoryDedicatedRequirements dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+    VkMemoryRequirements2 requirements{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+    requirements.pNext = &dedicated;
+    VkImageMemoryRequirementsInfo2 query{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2};
+    query.image = image.image;
+    vkGetImageMemoryRequirements2(s_device, &query, &requirements);
+    VkMemoryDedicatedAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    allocation.image = image.image;
+    image.memory = allocate(requirements.memoryRequirements, MemoryUse::DeviceLocal, false,
+                            dedicated.requiresDedicatedAllocation || dedicated.prefersDedicatedAllocation ? &allocation : nullptr);
     if (!image.memory || vkBindImageMemory(s_device, image.image, image.memory.memory, image.memory.offset) != VK_SUCCESS) {
         TXDIAG(txdiag::event("image_memory_failed","\"image\":%llu,\"memory\":%llu",txdiag::handle(image.image),txdiag::handle(image.memory.memory)));
         RBREW_LOGF(stderr, "[vk] FATAL: out of device memory for a %ux%u image\n", desc.width, desc.height);
@@ -1863,11 +1929,12 @@ bool present(Image& source, uint32_t width, uint32_t height) {
     VkSemaphore rendered = s_swapchain.rendered[index];
     const uint64_t serial = submit_with(&acquired, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, &rendered);
     if (readback.buffer) {
-        wait_serial(serial);
-        s_last_present_w = extent.width; s_last_present_h = extent.height;
-        s_last_present.assign(readback.memory.mapped, readback.memory.mapped + size_t(extent.width) * extent.height * 4);
-        if (s_swapchain.format == VK_FORMAT_B8G8R8A8_UNORM || s_swapchain.format == VK_FORMAT_B8G8R8A8_SRGB)
-            for (size_t i = 0; i < s_last_present.size(); i += 4) std::swap(s_last_present[i], s_last_present[i + 2]);
+        if (wait_serial(serial) && invalidate_mapped(readback.memory)) {
+            s_last_present_w = extent.width; s_last_present_h = extent.height;
+            s_last_present.assign(readback.memory.mapped, readback.memory.mapped + size_t(extent.width) * extent.height * 4);
+            if (s_swapchain.format == VK_FORMAT_B8G8R8A8_UNORM || s_swapchain.format == VK_FORMAT_B8G8R8A8_SRGB)
+                for (size_t i = 0; i < s_last_present.size(); i += 4) std::swap(s_last_present[i], s_last_present[i + 2]);
+        }
         destroy_buffer(readback);
     }
     slot_serial = serial;
@@ -1921,11 +1988,13 @@ bool read_image(Image& image, VkImageAspectFlags aspect, uint32_t level, uint32_
     const uint64_t serial = submit(false);
     const bool ok = wait_serial(serial);
     if (ok) {
-        out.assign(staging.memory.mapped, staging.memory.mapped + bytes);
+        const bool visible = invalidate_mapped(staging.memory);
+        if (visible) out.assign(staging.memory.mapped, staging.memory.mapped + bytes);
         // The copy has completed and no later command can use this one-shot
         // buffer. Do not keep it until a nonexistent next submission.
         vkDestroyBuffer(s_device, staging.buffer, nullptr);
         free_now(staging.memory);
+        return visible;
     } else destroy_buffer(staging);
     return ok;
 }
