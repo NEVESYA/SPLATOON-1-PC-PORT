@@ -31,7 +31,7 @@ uint64_t gx2_write_query_count(); // diagnostic: actual platform write-watch cal
 // OS again (every command in the batch was queued before it started). Only
 // the calling thread reuses; other callers query every time.
 void gx2_write_watch_begin_batch();
-struct Gx2WriteWatchStats { uint64_t ranges=0,queries=0,reused=0; };
+struct Gx2WriteWatchStats { uint64_t ranges=0,queries=0,reused=0,range_hits=0; };
 Gx2WriteWatchStats gx2_write_watch_stats();
 // Pages of [mem, mem + size) written at least once since the arena was
 // reserved: pages the OS still reports written plus pages this module already

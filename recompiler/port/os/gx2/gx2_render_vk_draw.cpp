@@ -11,6 +11,7 @@
 #include "gx2_shader_program.h"
 #include "gx2_perf.h"
 #include "gx2_write_watch.h"
+#include <bit>
 #include "gx2_shader_key.h"
 #include "r700_translation_reads.h"
 #include "gx2_host_memory.h"
@@ -557,6 +558,9 @@ std::unique_ptr<gx2vk::CompileQueue> s_compile_queue;
 #ifdef RBREW_GX2_QUEUE_TESTS
 std::function<void()> s_compile_test_gate;
 uint64_t s_pixel_translation_posts = 0;
+#endif
+#if defined(RBREW_GX2_QUEUE_TESTS) || defined(RBREW_ADVANCED_TESTS)
+#define RBREW_GX2_KEY_TEST_HOOKS 1
 uint64_t s_exact_key_memo_hits = 0, s_last_exact_key = 0;
 bool s_test_key_memo_enabled = true;
 #endif
@@ -589,7 +593,25 @@ template<class T> T await_compile(const gx2vk::CompileQueue::Job<T>& job) {
 template<class T> T await_compile(gx2vk::ResolvedCompileJob<T>& job) {
     return job.get([](const auto& pending){return await_compile(pending);});
 }
+struct VertexFetchPlan {
+    struct Attribute { uint32_t location, buffer, offset, divisor, guest_format; VkFormat format; bool per_instance; };
+    std::vector<Attribute> attributes;
+    std::array<uint32_t,32> imports{};
+    uint64_t revision=0;
+    uint32_t used_slots=0, input_limit=0;
+    bool valid=false;
+};
+struct ProgramLayouts {
+    VkDevice device=VK_NULL_HANDLE;
+    VkDescriptorSetLayout set=VK_NULL_HANDLE;
+    VkPipelineLayout pipeline=VK_NULL_HANDLE;
+    ~ProgramLayouts(){if(pipeline)vkDestroyPipelineLayout(device,pipeline,nullptr);if(set)vkDestroyDescriptorSetLayout(device,set,nullptr);}
+};
+std::mutex s_layout_mutex;
+std::unordered_map<std::string,std::shared_ptr<ProgramLayouts>> s_program_layouts;
 struct Program {
+    VertexFetchPlan vertex_fetch;
+    std::shared_ptr<ProgramLayouts> shared_layouts;
     uint32_t id = 0;
     std::array<R700TranslationInfo, 2> info;
     std::string vs_source, ps_source, gs_source;
@@ -602,6 +624,9 @@ struct Program {
     std::vector<VkDescriptorSetLayoutBinding> bindings;
     std::vector<uint32_t> dynamic_uniform_bindings; // sorted Vulkan dynamic-offset order
     std::vector<uint8_t> attribute_semantics; // immutable ascending live semantics
+    // Per stage, bit b set when uniform bank b / texture slot b has a binding
+    // (create_program_layouts); draws visit only those, in ascending order.
+    std::array<uint32_t, 2> live_banks{}, live_textures{};
     VkPipelineLayout layout = VK_NULL_HANDLE;
     bool valid = false;
     std::string ufblock_cache[2];      // last uploaded uniform-variable block per stage
@@ -624,8 +649,8 @@ std::vector<VkDescriptorPool> s_free_descriptor_pools;
 // make an old entry appear to describe a new resource. Pools are reset only
 // after their last serial has completed. No cache or memory usage cap is added.
 uint64_t s_descriptor_cache_serial = 0;
-std::unordered_map<std::string,VkDescriptorSet> s_descriptor_sets;
-std::string s_descriptor_key;
+struct DescriptorKeyHash { using is_transparent=void; size_t operator()(std::string_view key) const noexcept; };   // KeyHash, defined below
+std::unordered_map<std::string,VkDescriptorSet,DescriptorKeyHash,std::equal_to<>> s_descriptor_sets;
 
 GX2ShaderProgram active_shader_program(uint8_t* mem, bool pixel) {
     if (pixel ? S.ps_from_regs : S.vs_from_regs) {
@@ -681,6 +706,8 @@ struct KeyHash {
     }
 };
 
+size_t DescriptorKeyHash::operator()(std::string_view key) const noexcept { KeyHash h; h.add(key.data(), key.size()); return size_t(h.finish()); }
+
 void trace_program_key_miss(uint32_t vs, uint32_t ps, bool reused) {
 #ifndef RBREW_DISABLE_LOGGING
     static const bool on = rbrew_diagnostic_env("RBREW_PROGRAM_KEY_TRACE") != nullptr;
@@ -718,6 +745,9 @@ bool create_program_layouts(Program& p, bool allow_push = true) {
     for (unsigned stage = 0; stage < 2; ++stage) {
         const auto& vk = p.info[stage].vk;
         const VkShaderStageFlags flags = stage == 0 ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
+        p.live_banks[stage] = p.live_textures[stage] = 0;
+        for (unsigned b = 0; b < 16; ++b) if (vk.uniform_buffer_bindings[b] >= 0) p.live_banks[stage] |= 1u << b;
+        for (unsigned t = 0; t < 18; ++t) if (vk.texture_bindings[t] >= 0) p.live_textures[stage] |= 1u << t;
         if (vk.uniform_vars_binding >= 0)
             bindings.push_back({uint32_t(vk.uniform_vars_binding), VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, flags, nullptr});
         for (unsigned b = 0; b < 16; ++b)
@@ -744,14 +774,38 @@ bool create_program_layouts(Program& p, bool allow_push = true) {
     info.flags = p.push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0;
     info.bindingCount = uint32_t(bindings.size());
     info.pBindings = bindings.data();
-    if (vkCreateDescriptorSetLayout(gx2vk::device(), &info, nullptr, &p.set_layout) != VK_SUCCESS) return false;
+    // Layout compatibility depends on descriptor declarations, not shader
+    // identity. Share exact interfaces so material switches can also reuse
+    // descriptor sets and existing bindings. No resource/state sorting occurs.
+    auto ordered=bindings;
+    std::sort(ordered.begin(),ordered.end(),[](const auto& a,const auto& b){return a.binding<b.binding;});
+    std::string key;
+    auto add=[&](const auto& value){key.append(reinterpret_cast<const char*>(&value),sizeof(value));};
+    add(info.flags);add(info.bindingCount);
+    for(const auto& b:ordered){add(b.binding);add(b.descriptorType);add(b.descriptorCount);add(b.stageFlags);
+        const bool immutable=b.pImmutableSamplers!=nullptr;add(immutable);
+        if(immutable)for(uint32_t i=0;i<b.descriptorCount;++i)add(b.pImmutableSamplers[i]);
+    }
+    std::lock_guard lock(s_layout_mutex); // compiler workers only; never on a draw
+    if(auto it=s_program_layouts.find(key);it!=s_program_layouts.end()) {
+        p.shared_layouts=it->second;p.set_layout=it->second->set;p.layout=it->second->pipeline;return true;
+    }
+    auto shared=std::make_shared<ProgramLayouts>();shared->device=gx2vk::device();
+    if (vkCreateDescriptorSetLayout(shared->device, &info, nullptr, &shared->set) != VK_SUCCESS) return false;
     VkPushConstantRange range{VK_SHADER_STAGE_VERTEX_BIT, 0, 4};
     VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layout.setLayoutCount = 1;
-    layout.pSetLayouts = &p.set_layout;
+    layout.pSetLayouts = &shared->set;
     layout.pushConstantRangeCount = 1;
     layout.pPushConstantRanges = &range;
-    return vkCreatePipelineLayout(gx2vk::device(), &layout, nullptr, &p.layout) == VK_SUCCESS;
+    if(vkCreatePipelineLayout(shared->device,&layout,nullptr,&shared->pipeline)!=VK_SUCCESS)return false;
+    s_program_layouts.emplace(std::move(key),shared);p.shared_layouts=std::move(shared);
+    p.set_layout=p.shared_layouts->set;p.layout=p.shared_layouts->pipeline;return true;
+}
+
+void release_program_layouts(Program& p) {
+    if(!p.shared_layouts){if(p.layout)vkDestroyPipelineLayout(gx2vk::device(),p.layout,nullptr);if(p.set_layout)vkDestroyDescriptorSetLayout(gx2vk::device(),p.set_layout,nullptr);}
+    p.shared_layouts.reset();p.layout=VK_NULL_HANDLE;p.set_layout=VK_NULL_HANDLE;
 }
 
 // Persistent translation cache. The in-memory program cache already treats
@@ -1410,6 +1464,14 @@ constexpr unsigned kExactWordIndex(uint32_t r) {
     }
     return ~0u;
 }
+// Register number of each key word, in order: one flat gather per draw
+// instead of a per-range copy (most ranges hold a single register).
+constexpr std::array<uint16_t, kExactKeyRegisterCount> kExactKeyRegisters = [] {
+    std::array<uint16_t, kExactKeyRegisterCount> registers{};
+    unsigned i = 0;
+    for (const auto& range : kGx2TranslatorRegisters) for (uint32_t r = range.first; r <= range.last; ++r) registers[i++] = uint16_t(r);
+    return registers;
+}();
 static_assert(kExactWordIndex(0xA18E) - kExactWordIndex(0xA185) == 9 && kExactWordIndex(0xA1B0) - kExactWordIndex(0xA191) == 31);
 // Per exact base key: the VS parameters and texture units the translation
 // read (r700_translation_reads.h). Until a translation with this base has
@@ -1417,10 +1479,13 @@ static_assert(kExactWordIndex(0xA18E) - kExactWordIndex(0xA185) == 9 && kExactWo
 struct ExactReads { uint32_t vs_parameter_mask, vs_texture_mask, ps_texture_mask; };
 std::unordered_map<uint64_t, ExactReads> s_exact_reads;
 
-// Reuse the last exact key only after comparing every input the existing
-// algorithm hashes. Code bytes stay live: no address-only or write-watch
-// shortcut, and no new disk identity. Read masks only grow through emplace;
-// their count invalidates a key computed before a mask was discovered.
+// Reuse a memoized exact key only after comparing every input the existing
+// algorithm hashes, and no new disk identity. Code bytes are compared unless
+// the page write generations - the same per-batch evidence that already gates
+// cached index, vertex and uniform reuse - prove no CPU write reached either
+// program since its bytes were captured or last compared. Untracked memory
+// and any newer write still compare every byte. Read masks only grow through
+// emplace; their count invalidates a key computed before a mask was discovered.
 struct ExactKeyInputs {
     std::array<uint32_t, kExactKeyRegisterCount> words{};
     std::array<uint32_t, 36> texture_bits{};
@@ -1431,23 +1496,49 @@ struct ExactKeyInputs {
 struct ExactKeyMemo {
     ExactKeyInputs inputs;
     std::vector<uint8_t> vs, ps;
+    uint64_t vs_written = kGx2WriteUntracked, ps_written = kGx2WriteUntracked;   // generations proven equal to vs/ps
     size_t masks = 0;
     uint64_t key = 0, base = 0, canon = 0;
     bool valid = false;
-    bool matches(const ExactKeyInputs& current, const uint8_t* vertex, size_t vertex_size,
-                 const uint8_t* pixel, size_t pixel_size) const {
-        return valid && masks == s_exact_reads.size() && inputs == current &&
-            vs.size() == vertex_size && ps.size() == pixel_size &&
-            std::memcmp(vs.data(), vertex, vertex_size) == 0 && std::memcmp(ps.data(), pixel, pixel_size) == 0;
+    static bool same_code(const std::vector<uint8_t>& saved, uint64_t& proven, const uint8_t* live, size_t size, uint64_t written) {
+        if (saved.size() != size) return false;
+        if (written != kGx2WriteUntracked && proven != kGx2WriteUntracked && written <= proven) return true;
+        if (std::memcmp(saved.data(), live, size) != 0) return false;
+        proven = written;   // the bytes queried at `written` are identical
+        return true;
     }
-    void capture(const ExactKeyInputs& current, const uint8_t* vertex, size_t vertex_size,
-                 const uint8_t* pixel, size_t pixel_size) {
+    bool matches(const ExactKeyInputs& current, const uint8_t* vertex, size_t vertex_size, uint64_t vertex_written,
+                 const uint8_t* pixel, size_t pixel_size, uint64_t pixel_written) {
+        return valid && masks == s_exact_reads.size() && inputs == current &&
+            same_code(vs, vs_written, vertex, vertex_size, vertex_written) && same_code(ps, ps_written, pixel, pixel_size, pixel_written);
+    }
+    // Generations must be queried before the bytes are read (gx2_write_watch.h).
+    void capture(const ExactKeyInputs& current, const uint8_t* vertex, size_t vertex_size, uint64_t vertex_written,
+                 const uint8_t* pixel, size_t pixel_size, uint64_t pixel_written) {
         valid = false;
         vs.assign(vertex, vertex + vertex_size); ps.assign(pixel, pixel + pixel_size);
+        vs_written = vertex_written; ps_written = pixel_written;
         inputs = current; masks = s_exact_reads.size();
     }
 };
-ExactKeyMemo s_exact_key_memo;
+// Populated scenes alternate many shader/state combinations between draws
+// (one owner cache: ~49,800 exact keys for ~2,400 modules), so a single
+// last-key memo rehashed both programs' bytecode on nearly every switch.
+// Recent combinations each keep a slot, chosen by a hash of the program
+// ranges and every key input; a hit still compares all of them and every
+// code byte, exactly as the single memo did. A slot collision only recomputes.
+constexpr size_t kExactKeyMemoSlots = 256;
+std::vector<ExactKeyMemo> s_exact_key_memos;
+ExactKeyMemo* s_last_exact_key_memo = nullptr;   // previous draw's slot: consecutive draws often repeat it
+ExactKeyMemo& exact_key_memo_slot(const ExactKeyInputs& in, const GX2ShaderProgram& vs, const GX2ShaderProgram& ps) {
+    if (s_exact_key_memos.empty()) s_exact_key_memos.resize(kExactKeyMemoSlots);
+    KeyHash h;
+    const uint32_t ranges[] = {vs.address, vs.size, ps.address, ps.size, in.rect, in.points, in.vs_attribs};
+    h.add(ranges, sizeof(ranges));
+    h.add(in.words.data(), sizeof(in.words)); h.add(in.texture_bits.data(), sizeof(in.texture_bits));
+    h.add(&in.fetch_hash, sizeof(in.fetch_hash));
+    return s_exact_key_memos[h.finish() & (kExactKeyMemoSlots - 1)];
+}
 
 // Canonical translation identity: the exact key's inputs with every register
 // word reduced to the bits the translator reads (gx2_translator_register_bits)
@@ -1476,7 +1567,7 @@ bool canonical_key_enabled() {
 }
 bool exact_key_memo_enabled() {
     static const bool enabled = [] { const char* v = std::getenv("RBREW_SHADER_KEY_MEMO"); return !(v && v[0] == '0'); }();
-#ifdef RBREW_GX2_QUEUE_TESTS
+#ifdef RBREW_GX2_KEY_TEST_HOOKS
     return enabled && s_test_key_memo_enabled;
 #else
     return enabled;
@@ -1559,11 +1650,14 @@ Program* resolve_active_program_impl(uint8_t* mem) {
     // Vulkan: a points program must write gl_PointSize (from uf_pointSize),
     // so point primitives are part of the translation identity here.
     const uint32_t points = primitive == 0x01;
+    // Texture words of the previous and disk keys; the exact key reads its own.
     uint32_t texture_state[2 * 18 * 2];
-    unsigned texture_words = 0;
-    for (unsigned base : {0xE000u, 0xE460u}) for (unsigned slot = 0; slot < 18; ++slot) {
-        texture_state[texture_words++] = S.regs[base + slot * 7] & 7;
-        texture_state[texture_words++] = S.regs[base + slot * 7 + 4];
+    if (!exact_shader_key() || shader_key_verify()) {
+        unsigned texture_words = 0;
+        for (unsigned base : {0xE000u, 0xE460u}) for (unsigned slot = 0; slot < 18; ++slot) {
+            texture_state[texture_words++] = S.regs[base + slot * 7] & 7;
+            texture_state[texture_words++] = S.regs[base + slot * 7 + 4];
+        }
     }
     if (auto fs = S.fetch_shaders.find(S.active_fetch); fs != S.fetch_shaders.end()) fetch_attributes = &fs->second.attributes;
     auto hash_fetch = [&](KeyHash& h) {
@@ -1603,12 +1697,15 @@ Program* resolve_active_program_impl(uint8_t* mem) {
         const uint32_t vs_attribs = S.cur_vs_attribs;
         inputs.vs_attribs = vs_attribs;
         auto& words = inputs.words;
-        unsigned n = 0;
-        for (const auto& range : kGx2TranslatorRegisters) for (uint32_t r = range.first; r <= range.last; ++r) words[n++] = S.regs[r];
+        const unsigned n = kExactKeyRegisterCount;
+        for (unsigned i = 0; i < n; ++i) words[i] = S.regs[kExactKeyRegisters[i]];
         // SPI_PS_INPUT_CNTL_f is read only for f < SPI_PS_IN_CONTROL_0 & 0x3F
         // (clamped to 32): the one reader is LatteShader_CreatePSInputTable.
+        // The 32 words are contiguous in the key (static_assert above); index
+        // them from a compile-time base rather than searching every draw.
         const uint32_t ps_inputs = std::min<uint32_t>(S.regs[0xA1B3] & 0x3F, 32);
-        for (uint32_t f = ps_inputs; f < 32; ++f) words[kExactWordIndex(0xA191 + f)] = 0;
+        constexpr unsigned kPsInputWord = kExactWordIndex(0xA191);
+        std::fill(words.begin() + kPsInputWord + ps_inputs, words.begin() + kPsInputWord + 32, 0u);
         // Texture words: the translator reads DIM (word0 bits 0-2) and
         // NUM_FORMAT_ALL (word4 bits 8-9) of each unit it samples.
         auto& texture_bits = inputs.texture_bits;
@@ -1619,22 +1716,35 @@ Program* resolve_active_program_impl(uint8_t* mem) {
         hash_fetch(fetch);
         const uint64_t fetch_hash = fetch.finish();
         inputs.fetch_hash = fetch_hash;
-        if (exact_key_memo_enabled() && s_exact_key_memo.matches(inputs, mem + vs_program.address, vs_program.size,
-                                                               mem + ps_program.address, ps_program.size)) {
-            key = s_exact_key_memo.key; exact_base = s_exact_key_memo.base; canon = s_exact_key_memo.canon;
-#ifdef RBREW_GX2_QUEUE_TESTS
+        const bool memo = exact_key_memo_enabled();
+        Gx2WriteRange code[2] = {{vs_program.address, vs_program.size}, {ps_program.address, ps_program.size}};
+        ExactKeyMemo* memo_slot = nullptr;
+        bool memo_hit = false;
+        if (memo) {
+            gx2_write_generations(mem, code, 2);
+            auto hit = [&](ExactKeyMemo& m) {
+                return m.matches(inputs, mem + vs_program.address, vs_program.size, code[0].generation,
+                                 mem + ps_program.address, ps_program.size, code[1].generation);
+            };
+            // The previous slot is tried before hashing; either way every input is compared.
+            if (s_last_exact_key_memo && hit(*s_last_exact_key_memo)) { memo_slot = s_last_exact_key_memo; memo_hit = true; }
+            else { memo_slot = &exact_key_memo_slot(inputs, vs_program, ps_program); memo_hit = hit(*memo_slot); }
+            s_last_exact_key_memo = memo_slot;
+        }
+        if (memo_hit) {
+            key = memo_slot->key; exact_base = memo_slot->base; canon = memo_slot->canon;
+#ifdef RBREW_GX2_KEY_TEST_HOOKS
             ++s_exact_key_memo_hits;
 #endif
         } else {
-            const bool memo = exact_key_memo_enabled();
-            if (memo) s_exact_key_memo.capture(inputs, mem + vs_program.address, vs_program.size,
-                                              mem + ps_program.address, ps_program.size);
+            if (memo) memo_slot->capture(inputs, mem + vs_program.address, vs_program.size, code[0].generation,
+                                         mem + ps_program.address, ps_program.size, code[1].generation);
             KeyHash h;
             h.add(&kExactKeyTag, sizeof(kExactKeyTag));
             // Hash exactly the bytes retained for future comparisons, rather than
             // copying guest code a second time after computing its identity.
-            h.add(memo ? s_exact_key_memo.vs.data() : mem + vs_program.address, vs_program.size);
-            h.add(memo ? s_exact_key_memo.ps.data() : mem + ps_program.address, ps_program.size);
+            h.add(memo ? memo_slot->vs.data() : mem + vs_program.address, vs_program.size);
+            h.add(memo ? memo_slot->ps.data() : mem + ps_program.address, ps_program.size);
             gx2_perf_bytes(kBytesShaderKey, vs_program.size + ps_program.size);
             h.add(&rect, sizeof(rect)); h.add(&points, sizeof(points));
             h.add(&vs_attribs, sizeof(vs_attribs));
@@ -1676,17 +1786,17 @@ Program* resolve_active_program_impl(uint8_t* mem) {
                 canon = c.finish();
             }
             fresh_key = true;
-            if (memo) s_exact_key_memo.canon = canon;
+            if (memo) memo_slot->canon = canon;
             if (s_prog_cache.find(key) == s_prog_cache.end()) note_exact_key_miss(vs_program.address, ps_program.address, mem, vs_program.size,
                                                                                   ps_program.size, words.data(), texture_bits.data(), fetch_hash, rect | points << 2 | vs_attribs << 3);
-            if (memo) { s_exact_key_memo.key = key; s_exact_key_memo.base = exact_base; s_exact_key_memo.valid = true; }
+            if (memo) { memo_slot->key = key; memo_slot->base = exact_base; memo_slot->valid = true; }
         }
     } else {
         key = legacy_key(dynamic_key_registers_excluded());
         gx2_perf_bytes(kBytesShaderKey, vs_program.size + ps_program.size + 0x400 * 4);
     }
     auto it = s_prog_cache.find(key);
-#ifdef RBREW_GX2_QUEUE_TESTS
+#ifdef RBREW_GX2_KEY_TEST_HOOKS
     if (exact) s_last_exact_key = key;
 #endif
     key_scope.stop();
@@ -1974,9 +2084,11 @@ uint32_t vertex_input_limit() {
     const uint32_t device = std::min(limits.maxVertexInputAttributes, limits.maxVertexInputBindings);
     return device ? std::min(kMaxVertexInputs, device) : 16u;
 }
+// MSVC's std::hash over strings is byte-serial FNV-1a: about 0.5 us for a
+// ~400-byte pipeline key on every last-lookup miss. Equality is unchanged.
 struct PipelineKeyHash {
     using is_transparent=void;
-    size_t operator()(std::string_view key) const noexcept { return std::hash<std::string_view>{}(key); }
+    size_t operator()(std::string_view key) const noexcept { KeyHash h; h.add(key.data(), key.size()); return size_t(h.finish()); }
 };
 using PipelineJob=gx2vk::ResolvedCompileJob<VkPipeline>;
 std::unordered_map<std::string,PipelineJob,PipelineKeyHash,std::equal_to<>> s_pipelines;
@@ -2039,7 +2151,7 @@ struct PipelineKey {
 };
 gx2vk::LastLookup<PipelineKey::kCapacity,PipelineJob> s_last_pipeline_lookup;
 PipelineKey pipeline_key(const PipelineRequest& r, const PipelineSwitches& s) {
-    PipelineKey key{};
+    PipelineKey key;   // only the written prefix (view()) is ever read
     auto put = [&](const void* p, size_t n) { std::memcpy(key.bytes.data()+key.size,p,n);key.size+=n; };
     put(&r.program->id, 4); put(&r.ps_uint_mask, 4); put(&r.ps_sint_mask, 4); put(&r.topology, 4); put(&r.xfb, 1);
     put(&s.discard, sizeof(s.discard));
@@ -2594,47 +2706,57 @@ void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
     std::array<BufferRef, 32> vbo{};
     std::vector<R700FetchAttribute> none;
     const auto& attributes = it != S.fetch_shaders.end() ? it->second.attributes : none;
-    uint32_t used_slots = 0;
     // Fetch shaders describe the mesh's streams, including ones this vertex
     // program never reads (e.g. normals/UVs in a position-only depth pass).
     // Only those with a live shader location need write-watch checks/uploads.
     // The decompiler's location map also declares unmapped fetch semantics;
     // attribute import uses SQ_VTX_SEMANTIC_0..31 to select actual VS inputs.
-    std::array<bool,256> imported{};
-    for(unsigned i=0;i<32;++i)if(S.regs[0xA0E0+i]<255)imported[S.regs[0xA0E0+i]]=true;
-    for (const auto& attr : attributes)
-        if (attr.buffer < 32 && attr.semantic < 256 && imported[attr.semantic] && mapping[attr.semantic] >= 0 && uint32_t(mapping[attr.semantic]) < input_limit)
-            used_slots |= 1u << attr.buffer;
+    auto& plan=prog.vertex_fetch;
+    const uint64_t revision=it!=S.fetch_shaders.end()?it->second.revision:0;
+    if(!plan.valid || plan.revision!=revision || plan.input_limit!=input_limit ||
+       !std::equal(plan.imports.begin(),plan.imports.end(),S.regs.begin()+0xA0E0)) {
+        plan.valid=true;plan.revision=revision;plan.input_limit=input_limit;plan.used_slots=0;plan.attributes.clear();
+        std::copy_n(S.regs.begin()+0xA0E0,32,plan.imports.begin());
+        std::array<bool,256> imported{};
+        for(const uint32_t semantic:plan.imports)if(semantic<255)imported[semantic]=true;
+        for(const auto& attr:attributes) {
+            if(attr.buffer>=32 || attr.semantic>=256 || mapping[attr.semantic]<0 || uint32_t(mapping[attr.semantic])>=input_limit)continue;
+            if(imported[attr.semantic])plan.used_slots|=1u<<attr.buffer;
+            const auto native=r700_native_attribute(attr.format);
+            // Invalid formats retain the old ordered abort, but only when
+            // this stream actually has live storage at the draw.
+            plan.attributes.push_back({uint32_t(mapping[attr.semantic]),attr.buffer,attr.offset,attr.divisor,attr.format,
+                native.components?attribute_format(native.type,native.components):VK_FORMAT_UNDEFINED,attr.per_instance});
+        }
+    }
     std::array<Gx2WriteRange,32> checks{};
     std::array<unsigned,32> checked_slots{};unsigned check_count=0;
-    for (uint32_t slot = 0; slot < 32; ++slot) {
+    for (uint32_t m = plan.used_slots; m; m &= m - 1) {   // live streams, ascending
+        const uint32_t slot = uint32_t(std::countr_zero(m));
         const auto& ab = S.attrib[slot];
-        if (!(used_slots & (1u << slot)) || ab.guest_addr == 0 || ab.size == 0) continue;
+        if (ab.guest_addr == 0 || ab.size == 0) continue;
         if (!rbrew_memory_accessible(mem, ab.guest_addr, ab.size)) continue;
         checks[check_count]={ab.guest_addr,ab.size};checked_slots[check_count++]=slot;
     }
     gx2_write_generations(mem,checks.data(),check_count);
     for(unsigned i=0;i<check_count;++i)
         vbo[checked_slots[i]]=cached_vertex_buffer(mem,checks[i].address,checks[i].size,checks[i].generation);
-    struct Bound { uint32_t format_type, components, buffer, offset, stride, rate, divisor; };
+    struct Bound { VkFormat format; uint32_t buffer, offset, stride, rate, divisor; };
     std::array<std::optional<Bound>, kMaxVertexInputs> bound{};
-    for (const auto& attr : attributes) {
-        uint32_t location = attr.semantic;
+    for (const auto& attr : plan.attributes) {
+        const uint32_t location = attr.location;
         const uint32_t buf_slot = attr.buffer;
         uint32_t offset = attr.offset;
         if (g_trace_active)
-            RBREW_LOGF(stderr, "[ftrace]   attr sem=%u loc=%d buf=%u off=%u fmt=%X vbo_addr=%08X size=%u stride=%u\n", location,
-                         location < 256 ? mapping[location] : -2, buf_slot, offset, attr.format, buf_slot < 32 ? S.attrib[buf_slot].guest_addr : 0,
+            RBREW_LOGF(stderr, "[ftrace]   attr loc=%u buf=%u off=%u fmt=%X vbo_addr=%08X size=%u stride=%u\n", location,
+                         buf_slot, offset, attr.guest_format, buf_slot < 32 ? S.attrib[buf_slot].guest_addr : 0,
                          buf_slot < 32 ? S.attrib[buf_slot].size : 0, buf_slot < 32 ? S.attrib[buf_slot].stride : 0);
-        if (buf_slot >= 32 || location >= 256 || mapping[location] < 0) continue;
-        location = unsigned(mapping[location]);
-        if (location >= input_limit || !vbo[buf_slot].buffer) continue;
-        const auto gl = r700_native_attribute(attr.format);
-        if (!gl.components) break;   // the GPU loop aborts the remaining attributes
+        if (!vbo[buf_slot].buffer) continue;
+        if (attr.format==VK_FORMAT_UNDEFINED) break;   // the GPU loop aborts the remaining attributes
         const auto& ab = S.attrib[buf_slot];
         if (attr.per_instance && S.single_instance_fetch) offset += (S.instance_uniform / std::max(1u, attr.divisor)) * ab.stride;
         const uint32_t divisor = attr.per_instance ? (S.single_instance_fetch ? 1u : std::max(1u, attr.divisor)) : 0;
-        bound[location] = Bound{gl.type, gl.components, buf_slot, offset, ab.stride, attr.per_instance ? 1u : 0u, divisor};
+        bound[location] = Bound{attr.format, buf_slot, offset, ab.stride, attr.per_instance ? 1u : 0u, divisor};
     }
     // Every location the shader reads needs a binding in Vulkan; GPU supplies
     // the current generic attribute (0,0,0,1.0f) for disabled arrays.
@@ -2646,7 +2768,7 @@ void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
         auto& offset = out.offsets[out.input.count];
         if (bound[location]) {
             const auto& b = *bound[location];
-            a = {uint32_t(location), attribute_format(b.format_type, b.components), b.stride, b.rate, std::max(1u, b.divisor)};
+            a = {uint32_t(location), b.format, b.stride, b.rate, std::max(1u, b.divisor)};
             buffer = vbo[b.buffer].buffer;
             offset = vbo[b.buffer].offset + b.offset;
         } else {
@@ -2699,9 +2821,13 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
     const auto& vk = info.vk;
     d.write_count = d.buffer_count = d.image_count = 0;
     const VkDeviceSize ubo_align = std::max<VkDeviceSize>(gx2vk::caps().limits.minUniformBufferOffsetAlignment, 16);
-    for (unsigned slot = 0; slot < 18; ++slot) gx2_render_set_sampler_comparison((stage == 0 ? 32 : 0) + slot, info.texture_compare[slot]);
+    // Native sampler slots: PS 0-17, VS 18-35. Only a differing slot changes state.
+    static_assert(sizeof(info.texture_compare[0]) == sizeof(S.sampler_compare[0]));
+    if (std::memcmp(info.texture_compare.data(), S.sampler_compare.data() + (stage == 0 ? 18 : 0), 18 * sizeof(bool)) != 0)
+        for (unsigned slot = 0; slot < 18; ++slot) gx2_render_set_sampler_comparison((stage == 0 ? 32 : 0) + slot, info.texture_compare[slot]);
+    const uint32_t live_banks = prog.live_banks[stage], live_textures = prog.live_textures[stage];
     // Resolve aliases before packing the texture-coordinate scale uniforms.
-    for (unsigned t=0;t<18;++t) if(vk.texture_bindings[t]>=0) refresh_bound_render_texture((stage==0?32:0)+t,mem);
+    for (uint32_t m = live_textures; m; m &= m - 1) refresh_bound_render_texture((stage==0?32:0)+unsigned(std::countr_zero(m)),mem);
     // Uniform-variable block (uniforms that GPU keeps on the program).
     if (vk.uniform_vars_binding >= 0) {
         auto& block = prog.ufblock_scratch[stage];
@@ -2782,16 +2908,17 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
     std::array<Gx2WriteRange,16> block_checks{};
     std::array<unsigned,16> checked_banks{};unsigned block_check_count=0;
     std::array<uint64_t,16> block_generations{};
-    for(unsigned bank=0;bank<16;++bank) {
+    for(uint32_t m=live_banks;m;m&=m-1) {
+        const unsigned bank=unsigned(std::countr_zero(m));
         const auto& block=S.uniform_blocks[stage][bank];const int binding=info.buffer_bindings[bank];
-        if(vk.uniform_buffer_bindings[bank]<0 || binding<0 || binding>=48 || !block.address || !block.size ||
+        if(binding<0 || binding>=48 || !block.address || !block.size ||
            !rbrew_memory_accessible(mem,block.address,block.size))continue;
         block_checks[block_check_count]={block.address,block.size};checked_banks[block_check_count++]=bank;
     }
     gx2_write_generations(mem,block_checks.data(),block_check_count);
     for(unsigned i=0;i<block_check_count;++i)block_generations[checked_banks[i]]=block_checks[i].generation;
-    for (unsigned bank = 0; bank < 16; ++bank) {
-        if (vk.uniform_buffer_bindings[bank] < 0) continue;
+    for (uint32_t m = live_banks; m; m &= m - 1) {
+        const unsigned bank = unsigned(std::countr_zero(m));
         const int gl_binding = info.buffer_bindings[bank];
         auto& block = S.uniform_blocks[stage][bank];
         bool bound_now = false;
@@ -2841,8 +2968,8 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
         w.pBufferInfo = &buffer;
     }
     // Textures: GPU unit = stage base + unit, object of the shader's target.
-    for (unsigned t = 0; t < 18; ++t) {
-        if (vk.texture_bindings[t] < 0) continue;
+    for (uint32_t m = live_textures; m; m &= m - 1) {
+        const unsigned t = unsigned(std::countr_zero(m));
         const uint32_t unit = (stage == 0 ? 32 : 0) + t;
         const uint32_t dim = vk.texture_dim[t];
         const bool integer = vk.texture_integer[t], shadow = vk.texture_shadow[t];
@@ -2923,10 +3050,12 @@ bool bind_descriptors(VkCommandBuffer cb, Program& prog, VkWriteDescriptorSet* w
     }
     // Serialize fields individually, never structure padding or host pointers.
     // unordered_map checks complete key equality even on a hash collision.
-    auto& key=s_descriptor_key;key.clear();
+    // Built on the stack; only a new set's key is copied into the map.
+    constexpr size_t kKeyCapacity=sizeof(VkDescriptorSetLayout)+StageDescriptors::kMaxWrites*2*(2*sizeof(uint32_t)+3*sizeof(uint64_t));
+    std::array<char,kKeyCapacity> key_bytes;size_t key_size=0;
     std::array<uint32_t,StageDescriptors::kMaxBuffers*2> dynamic_offsets{};
     std::array<bool,StageDescriptors::kMaxWrites*2> dynamic{};
-    auto append=[&](const auto& value){key.append(reinterpret_cast<const char*>(&value),sizeof(value));};
+    auto append=[&](const auto& value){static_assert(sizeof(value)<=sizeof(uint64_t));std::memcpy(key_bytes.data()+key_size,&value,sizeof(value));key_size+=sizeof(value);};
     append(prog.set_layout);
     for(uint32_t i=0;i<write_count;++i) {
         const auto& w=writes[i];
@@ -2945,6 +3074,7 @@ bool bind_descriptors(VkCommandBuffer cb, Program& prog, VkWriteDescriptorSet* w
         else if(w.descriptorType==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER){const auto& b=*w.pImageInfo;append(b.sampler);append(b.imageView);append(b.imageLayout);}
         else return false;
     }
+    const std::string_view key(key_bytes.data(),key_size);
     VkDescriptorSet set = VK_NULL_HANDLE;
     if(const auto found=s_descriptor_sets.find(key);found!=s_descriptor_sets.end())set=found->second;
     else {
@@ -2988,7 +3118,7 @@ bool bind_descriptors(VkCommandBuffer cb, Program& prog, VkWriteDescriptorSet* w
         }
         TXDIAG(diagnostic_descriptors(set));
         vkUpdateDescriptorSets(gx2vk::device(),write_count,updates.data(),0,nullptr);
-        s_descriptor_sets.emplace(key,set);
+        s_descriptor_sets.emplace(std::string(key),set);
     }
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, prog.layout, 0, 1, &set,
         uint32_t(prog.dynamic_uniform_bindings.size()),dynamic_offsets.data());
@@ -3310,6 +3440,7 @@ static uint32_t s_shadow_depth_only_draws, s_shadow_color_draws, s_shadow_frames
 
 bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t count, uint32_t first_vertex, const IndexStream& indices, bool xfb,
                 void (*hook)(bool, VkCommandBuffer)) {
+    gx2vk::CommandBatch command_batch;
     TXDIAG(txdiag::count(txdiag::Draws));
     if (!prog) return trace_skip("no-program");
     s_last_program = prog->id;
@@ -4059,11 +4190,9 @@ void gx2r::shutdown_draw_state() {
         try { if (auto pipeline = await_compile(job)) vkDestroyPipeline(device, pipeline, nullptr); } catch (...) {}
     }
     s_pipelines.clear();
-    for (auto& [key, program] : s_prog_by_source) {
-        if (program->layout) vkDestroyPipelineLayout(device, program->layout, nullptr);
-        if (program->set_layout) vkDestroyDescriptorSetLayout(device, program->set_layout, nullptr);
-    }
-    s_prog_cache.clear(); s_prog_by_source.clear(); s_exact_reads.clear(); s_exact_key_memo = {}; s_canonical.clear(); s_canonical_reuses = 0; warm_reset(); s_compile_queue.reset(); s_next_program = 1;
+    for (auto& [key, program] : s_prog_by_source) release_program_layouts(*program);
+    s_prog_cache.clear(); s_prog_by_source.clear(); s_exact_reads.clear(); s_exact_key_memos.clear(); s_last_exact_key_memo = nullptr; s_canonical.clear(); s_canonical_reuses = 0; warm_reset(); s_compile_queue.reset(); s_next_program = 1;
+    {std::lock_guard lock(s_layout_mutex);s_program_layouts.clear();}
     for(unsigned i=0;i<4;++i) {gx2vk::destroy_buffer(s_streamout_data[i]);gx2vk::destroy_buffer(s_streamout_counter[i]);}
     s_streamout_limits_valid=false;
     for (auto& [key, pipeline] : s_transfer_pipelines) if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
@@ -4074,7 +4203,7 @@ void gx2r::shutdown_draw_state() {
     if (s_descriptor_pool) vkDestroyDescriptorPool(device, s_descriptor_pool, nullptr);
     for (auto& [serial, pool] : s_retired_pools) vkDestroyDescriptorPool(device, pool, nullptr);
     for(auto pool:s_free_descriptor_pools)vkDestroyDescriptorPool(device,pool,nullptr);
-    s_free_descriptor_pools.clear();s_descriptor_sets.clear();s_descriptor_key.clear();s_descriptor_cache_serial=0;
+    s_free_descriptor_pools.clear();s_descriptor_sets.clear();s_descriptor_cache_serial=0;
     s_descriptor_pool = VK_NULL_HANDLE; s_descriptor_pool_serial = 0; s_retired_pools.clear();
     for (auto& [key, buffer] : s_vertex_buffers) gx2vk::destroy_buffer(buffer.buffer);
     s_vertex_buffers.clear(); s_vertex_bytes = 0; s_vertex_evict_bucket = 0; s_vertex_stale.clear();

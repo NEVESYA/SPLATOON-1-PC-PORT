@@ -442,6 +442,29 @@ void rbrew_register_func(CPUState* cpu, uint32_t guest_addr, HostFunc fn) {
         cpu->dispatch_table[idx] = fn;
 }
 
+// Few hooks, set at startup before guest threads run; read on every wrapped call.
+namespace {
+struct GuestHookEntry { uint32_t address; RbrewGuestHook hook; };
+constexpr unsigned kMaxGuestHooks = 32;
+GuestHookEntry s_guest_hooks[kMaxGuestHooks];
+std::atomic<unsigned> s_guest_hook_count{0};
+}
+RbrewGuestHook rbrew_guest_hook(uint32_t guest_addr) {
+    const unsigned count = s_guest_hook_count.load(std::memory_order_acquire);
+    for (unsigned i = 0; i < count; ++i)
+        if (s_guest_hooks[i].address == guest_addr) return s_guest_hooks[i].hook;
+    return nullptr;
+}
+bool rbrew_set_guest_hook(uint32_t guest_addr, RbrewGuestHook hook) {
+    const unsigned count = s_guest_hook_count.load(std::memory_order_relaxed);
+    for (unsigned i = 0; i < count; ++i)
+        if (s_guest_hooks[i].address == guest_addr) { s_guest_hooks[i].hook = hook; return true; }
+    if (count == kMaxGuestHooks) return false;
+    s_guest_hooks[count] = {guest_addr, hook};
+    s_guest_hook_count.store(count + 1, std::memory_order_release);
+    return true;
+}
+
 #ifdef RBREW_ENABLE_COVERAGE
 #include <set>
 #include <tuple>

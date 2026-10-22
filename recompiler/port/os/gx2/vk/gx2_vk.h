@@ -113,6 +113,18 @@ void defer(std::function<void()> f);
 // Current command buffer (begun on first use).
 VkCommandBuffer cmd();
 bool has_recorded_commands();
+// Publish a draw's recording packets together. Direct operations and a full
+// ring still publish/drain immediately, preserving command ordering.
+bool begin_command_batch();
+void end_command_batch();
+class CommandBatch {
+    bool active_;
+public:
+    CommandBatch():active_(begin_command_batch()){}
+    ~CommandBatch(){if(active_)end_command_batch();}
+    CommandBatch(const CommandBatch&)=delete;
+    CommandBatch& operator=(const CommandBatch&)=delete;
+};
 // Called before the command buffer is ended (end rendering, close query
 // sub-segments) and after a submission (renderer bookkeeping).
 void set_submit_hooks(void (*before_end)(), void (*after_submit)(uint64_t serial));
@@ -208,6 +220,10 @@ bool has_surface();
 // when the window changed. Returns false when nothing could be presented
 // (minimized window, lost surface).
 bool present(Image& source, uint32_t source_width, uint32_t source_height);
+// Real-time FPS overlay in presented images (default on; RBREW_FPS_OVERLAY=0
+// starts it hidden). Thread-safe toggle, e.g. from the window's key handler.
+void set_fps_overlay(bool visible);
+bool fps_overlay();
 uint64_t present_count();
 VkPresentModeKHR present_mode();
 
@@ -226,5 +242,6 @@ void set_name(VkObjectType type, uint64_t handle, const char* name);
 namespace gx2vk {
 // Tests: keep a host copy of each presented swapchain image (RGBA8).
 bool capture_presents(bool enable); // returns the previous setting
+void capture_fps_overlay(bool include); // captured presents normally omit the FPS overlay
 bool last_present(std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height);
 }

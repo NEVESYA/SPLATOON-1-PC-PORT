@@ -40,6 +40,7 @@ void gx2_draw_set_default_state(CPUState* cpu);
 #include <SDL2/SDL_syswm.h>
 #endif
 #include "vk/gx2_vk_shader.h"
+namespace gx2vk { void set_fps_overlay(bool visible); bool fps_overlay(); }   // vk/gx2_vk.h
 // gx2_render_vk.cpp owns the Vulkan device; this branch needs no GPU types.
 
 static SDL_Window*   s_window    = nullptr;
@@ -57,7 +58,7 @@ static void update_window_title() {
     if (!s_window) return;
     constexpr const char* backend = "Vulkan";
     char title[192];
-    std::snprintf(title, sizeof(title), "Splatoon | %s | %s | %.1f FPS  (Tab = switch | F11 = fullscreen)",
+    std::snprintf(title, sizeof(title), "Splatoon | %s | %s | %.1f FPS  (Tab = switch | F11 = fullscreen | F3 = FPS overlay)",
                   backend, g_screen_mode == ScreenMode::TV ? "TV" : "Gamepad", s_window_fps);
     SDL_SetWindowTitle(s_window, title);
 }
@@ -532,6 +533,8 @@ static void GX2SwapScanBuffers(CPUState* cpu) {
             case SDL_KEYDOWN:
                 if (ev.key.keysym.scancode == SDL_SCANCODE_TAB) {
                     toggle_screen_mode();
+                } else if (ev.key.keysym.scancode == SDL_SCANCODE_F3 && !ev.key.repeat) {
+                    gx2vk::set_fps_overlay(!gx2vk::fps_overlay());
                 } else if (ev.key.keysym.scancode == SDL_SCANCODE_F11) {
                     // Toggle fullscreen / windowed
                     bool is_full = (SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;

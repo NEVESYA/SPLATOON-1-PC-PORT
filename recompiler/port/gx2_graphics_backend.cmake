@@ -38,3 +38,9 @@ function(rbrew_gx2_backend target scope)
     target_link_libraries(${target} ${scope} Vulkan::Headers volk::volk glslang::glslang
         glslang::glslang-default-resource-limits glslang::SPIRV)
 endfunction()
+# Debug information for the renderer sources only, so gambit_render_profile
+# can name hot functions and lines. Code generation is unchanged.
+option(RBREW_GX2_DEBUG_INFO "Emit debug information for the GX2 renderer sources (profiling)" OFF)
+if(RBREW_GX2_DEBUG_INFO AND MSVC)
+    set_source_files_properties(${RBREW_GX2_BACKEND_SOURCES} PROPERTIES COMPILE_OPTIONS "/Zi")
+endif()

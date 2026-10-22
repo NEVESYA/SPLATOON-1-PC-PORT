@@ -2,6 +2,7 @@
 #include "gx2_detile.h"
 #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -131,13 +132,32 @@ template<class F> bool with_addresses(const Gx2DetileDesc& d, F&& transfer) {
 }
 template<size_t Bytes> bool detile_elements(const Gx2DetileDesc& d,const uint8_t* tiled,size_t tiled_size,uint8_t* out) {
     return with_addresses(d,[&](auto address_of) {
+        // Within an 8x8 microtile only the pixel-index bits change. Bank,
+        // pipe, macro-tile and slice bits belong to the tile base. Derive the
+        // byte-address XORs from AddrLib itself (including depth/thick modes),
+        // then calculate the expensive base once per eight output texels.
+        const bool tiled_rows=d.width>=8 && d.tile_mode>=4 && d.tile_mode<=15 && uint64_t(d.width)*d.height>=512;
+        std::array<uint32_t,64> offsets;
+        if(tiled_rows) {
+            const uint32_t origin=address_of(0,0);
+            for(unsigned y=0;y<8;++y)for(unsigned x=0;x<8;++x)offsets[y*8+x]=address_of(x,y)^origin;
+        }
         auto rows = [&](uint32_t y0,uint32_t y1) {
-            for(uint32_t y=y0;y<y1;++y) for(uint32_t x=0;x<d.width;++x) {
-                const uint32_t address=address_of(x,y);
-                if(uint64_t(address)+Bytes>tiled_size)return false;
-                // Constant-sized memcpy becomes an unaligned scalar/SIMD move,
-                // rather than a variable-sized library call for every texel.
-                std::memcpy(out+(size_t(y)*d.width+x)*Bytes,tiled+address,Bytes);
+            for(uint32_t y=y0;y<y1;++y) {
+                uint32_t x=0;
+                if(tiled_rows)for(;uint64_t(x)+8<=d.width;x+=8) {
+                    const uint32_t base=address_of(x,y&~7u);
+                    for(unsigned i=0;i<8;++i) {
+                        const uint32_t address=base^offsets[(y&7)*8+i];
+                        if(uint64_t(address)+Bytes>tiled_size)return false;
+                        std::memcpy(out+(size_t(y)*d.width+x+i)*Bytes,tiled+address,Bytes);
+                    }
+                }
+                for(;x<d.width;++x) {
+                    const uint32_t address=address_of(x,y);
+                    if(uint64_t(address)+Bytes>tiled_size)return false;
+                    std::memcpy(out+(size_t(y)*d.width+x)*Bytes,tiled+address,Bytes);
+                }
             }
             return true;
         };
@@ -163,8 +183,21 @@ template<size_t Bytes> bool retile_elements(const Gx2DetileDesc& d,const uint8_t
             if(uint64_t(address_of(uint32_t(x)|7,uint32_t(y)|7))+Bytes>tiled_size) {blocks_fit=false;break;}
         if(!blocks_fit)for(uint32_t y=0;y<d.height;++y)for(uint32_t x=0;x<d.width;++x)
             if(uint64_t(address_of(x,y))+Bytes>tiled_size)return false;
-        for(uint32_t y=0;y<d.height;++y)for(uint32_t x=0;x<d.width;++x)
-            std::memcpy(tiled+address_of(x,y),linear+(size_t(y)*d.width+x)*Bytes,Bytes);
+        const bool tiled_rows=d.width>=8 && d.tile_mode>=4 && d.tile_mode<=15 && uint64_t(d.width)*d.height>=512;
+        std::array<uint32_t,64> offsets;
+        if(tiled_rows) {
+            const uint32_t origin=address_of(0,0);
+            for(unsigned y=0;y<8;++y)for(unsigned x=0;x<8;++x)offsets[y*8+x]=address_of(x,y)^origin;
+        }
+        for(uint32_t y=0;y<d.height;++y) {
+            uint32_t x=0;
+            if(tiled_rows)for(;uint64_t(x)+8<=d.width;x+=8) {
+                const uint32_t base=address_of(x,y&~7u);
+                for(unsigned i=0;i<8;++i)
+                    std::memcpy(tiled+(base^offsets[(y&7)*8+i]),linear+(size_t(y)*d.width+x+i)*Bytes,Bytes);
+            }
+            for(;x<d.width;++x)std::memcpy(tiled+address_of(x,y),linear+(size_t(y)*d.width+x)*Bytes,Bytes);
+        }
         return true;
     });
 }

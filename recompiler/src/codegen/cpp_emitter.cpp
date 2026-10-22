@@ -196,9 +196,12 @@ void CppEmitter::emit_header(std::ostream& out) {
         << std::hex << m_rpx.entry_point << "u;\n}\n\n"
            "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n";
 
-    for (const auto& func : m_ir.functions)
+    for (const auto& func : m_ir.functions) {
         out << "void " << m_names.function_name(func.entry_addr, func.name)
             << "(CPUState* cpu);\n";
+        if (m_cfg.hooked.contains(func.entry_addr))
+            out << "void " << m_names.function_name(func.entry_addr, func.name) << "_unhooked(CPUState* cpu);\n";
+    }
 
     out << "\n#ifdef __cplusplus\n} // extern \"C\"\n#endif\n";
     if (m_cfg.emit_ppc_image)
@@ -348,6 +351,15 @@ void CppEmitter::emit_function(const ir::IRFunction& func, std::ostream& out) {
         out << "// " << func.name << " @ 0x" << std::hex << func.entry_addr << "\n";
 
     std::string fname = m_names.function_name(func.entry_addr, func.name);
+    if (m_cfg.hooked.contains(func.entry_addr)) {
+        // Every caller (direct call or dispatch table) enters this wrapper;
+        // the body keeps its exact code under the _unhooked name.
+        out << "void " << fname << "(CPUState* cpu) {\n"
+            << "    if (const RbrewGuestHook hook = rbrew_guest_hook(0x" << std::hex << func.entry_addr
+            << "u)) { hook(cpu, 0x" << func.entry_addr << "u, " << fname << "_unhooked); return; }\n"
+            << "    " << fname << "_unhooked(cpu);\n}\n";
+        fname += "_unhooked";
+    }
     out << "void " << fname << "(CPUState* cpu) {\n";
     out << "#ifdef RBREW_ENABLE_COVERAGE\n    RBREW_COVERAGE_FUNCTION(0x" << std::hex << func.entry_addr << "u);\n#endif\n";
 

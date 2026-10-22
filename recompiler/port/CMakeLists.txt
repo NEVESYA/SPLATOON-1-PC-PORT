@@ -52,6 +52,7 @@ add_library(gambit_runtime STATIC
     os/padscore/padscore.cpp
     os/stubs/stubs.cpp
     os/nsysnet/nsysnet.cpp
+    os/game/player_anim.cpp
     loader/gambit_loader.cpp
     loader/native_console_profile.cpp
 )
@@ -233,13 +234,32 @@ endif()
 option(RBREW_BUILD_TESTS "Build Nintendo-free native performance regression tests" OFF)
 if(RBREW_BUILD_TESTS)
     enable_testing()
+    add_executable(gambit_texture_bench ../tests/test_texture_streaming.cpp)
+    target_link_libraries(gambit_texture_bench PRIVATE gambit_runtime)
+    target_include_directories(gambit_texture_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(WIN32)
+        target_link_libraries(gambit_texture_bench PRIVATE psapi)
+    endif()
+    foreach(case layouts uniforms textures edgecases)
+        add_test(NAME streaming_${case} COMMAND gambit_texture_bench ${case})
+        set_tests_properties(streaming_${case} PROPERTIES TIMEOUT 120)
+    endforeach()
     add_executable(gambit_render_bench ../tests/test_render_performance.cpp)
     target_link_libraries(gambit_render_bench PRIVATE gambit_runtime)
     target_include_directories(gambit_render_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     if(WIN32)
         target_link_libraries(gambit_render_bench PRIVATE psapi)
     endif()
-    foreach(case fallback push churn contracts lifetime)
+    if(MSVC)
+        # Same authored workloads with an opt-in main-thread sampler
+        # (RBREW_BENCH_SAMPLE=1) and a PDB for function names. Not a test.
+        add_executable(gambit_render_profile ../tests/test_render_performance.cpp)
+        target_compile_definitions(gambit_render_profile PRIVATE RBREW_BENCH_SAMPLER=1)
+        target_link_libraries(gambit_render_profile PRIVATE gambit_runtime psapi dbghelp)
+        target_include_directories(gambit_render_profile PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_options(gambit_render_profile PRIVATE /DEBUG)
+    endif()
+    foreach(case fallback push churn contracts lifetime heavy heavy_push overdraw watch geometry packets plaza overlay overlay_present guest_hooks idle_lookaround)
         add_test(NAME render_${case} COMMAND gambit_render_bench ${case})
         set_tests_properties(render_${case} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()

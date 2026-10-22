@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 #include "../../runtime/rebrewu_memory_observer.h"
 #include "../../runtime/rbrew_diagnostics.h"
@@ -22,6 +23,11 @@ uint32_t s_generation = 0;
 std::vector<void*> s_written;
 uint64_t s_queries=0,s_checks=0,s_reused=0;
 std::vector<Gx2WriteRange*> s_ranges;
+// Repeated mesh ranges otherwise rescan every page for each shadow/material
+// draw, even when all pages were already collected in this render batch.
+struct RangeGeneration { uint64_t revision=0, generation=0; };
+std::unordered_map<uint64_t,RangeGeneration> s_range_generations;
+uint64_t s_range_revision=1, s_range_hits=0;
 
 // Batch epochs (render thread only). Every command of a render batch was
 // queued before the batch started, so every write that preceded its issue
@@ -57,11 +63,15 @@ void select_arena(const uint8_t* mem) {
         s_page_collected.assign((size_t(1) << 20) / 64, 0);
         s_page_epoch.assign(size_t(1) << 20, 0);
         s_generation = 0;
+        s_range_generations.clear();
     }
 }
 void forget_collected(uint32_t address, uint32_t size, void*) noexcept {
     if (!size) return;
     std::lock_guard lock(s_lock);
+    // The observer cannot allocate. A revision invalidates all memoized
+    // ranges conservatively, including overlaps and partial-page writes.
+    ++s_range_revision;
     if (s_page_epoch.empty()) return;
     const uint64_t last = std::min<uint64_t>((uint64_t(address) + size - 1) / kPage, s_page_epoch.size() - 1);
     for (uint64_t page = address / kPage; page <= last; ++page) s_page_epoch[page] = 0;
@@ -91,6 +101,9 @@ bool collect_pages(const uint8_t* mem,uint64_t first,uint64_t last) {
         return false;
     if (count) {
         ++s_generation;
+        // Collections by non-batch callers also update shared page history.
+        // Batch range answers must observe those newer generations.
+        ++s_range_revision;
         for (ULONG_PTR i = 0; i < count; ++i) {
             const size_t page = size_t((static_cast<const uint8_t*>(s_written[i]) - mem) / kPage);
             s_page_generation[page] = s_generation;
@@ -105,6 +118,22 @@ uint64_t newest(uint64_t first,uint64_t last) {
     for (uint64_t page = first; page <= last; ++page) generation = std::max(generation, s_page_generation[page]);
     return generation;
 }
+bool memoizable(const uint8_t* mem,uint32_t addr,uint32_t size) {
+    // Small UBOs are cheaper to scan directly. Only batch-owned, tracked
+    // pages participate; callers outside the render batch still ask the OS.
+    return t_epoch_reuse && mem==t_observed_mem &&
+        (uint64_t(addr)+size-1)/kPage-addr/kPage>=15;
+}
+bool memoized(const uint8_t* mem,uint32_t addr,uint32_t size,uint64_t& generation) {
+    if(!memoizable(mem,addr,size))return false;
+    const auto it=s_range_generations.find(uint64_t(addr)<<32|size);
+    if(it==s_range_generations.end() || it->second.revision!=s_range_revision)return false;
+    generation=it->second.generation;++s_range_hits;++s_reused;return true;
+}
+void remember_range(const uint8_t* mem,uint32_t addr,uint32_t size,uint64_t generation) {
+    if(generation!=kGx2WriteUntracked && memoizable(mem,addr,size))
+        s_range_generations[uint64_t(addr)<<32|size]={s_range_revision,generation};
+}
 }
 
 uint64_t gx2_write_generation(const uint8_t* mem,uint32_t addr,uint32_t size) {
@@ -113,19 +142,23 @@ uint64_t gx2_write_generation(const uint8_t* mem,uint32_t addr,uint32_t size) {
     const uint64_t first=addr/kPage,last=(uint64_t(addr)+size-1)/kPage;
     observe_render_writes(mem);
     std::lock_guard lock(s_lock);select_arena(mem);++s_checks;
-    if(collected_this_epoch(mem,first,last))return newest(first,last);
-    return collect_pages(mem,first,last)?newest(first,last):kGx2WriteUntracked;
+    uint64_t generation;
+    if(memoized(mem,addr,size,generation))return generation;
+    generation=(collected_this_epoch(mem,first,last) || collect_pages(mem,first,last))?newest(first,last):kGx2WriteUntracked;
+    remember_range(mem,addr,size,generation);return generation;
 }
 void gx2_write_generations(const uint8_t* mem,Gx2WriteRange* ranges,uint32_t count) {
     if(!ranges || !count)return;
     if(mem)observe_render_writes(mem);
     std::lock_guard lock(s_lock);
+    if(mem)select_arena(mem);
     s_ranges.clear();
     for(uint32_t i=0;i<count;++i) {
         auto& range=ranges[i];range.generation=0;
         if(!mem || !range.size)continue;
         if(uint64_t(range.address)+range.size>(1ull<<32) || tracking_disabled()){range.generation=kGx2WriteUntracked;continue;}
-        s_ranges.push_back(&range);++s_checks;
+        ++s_checks;
+        if(!memoized(mem,range.address,range.size,range.generation))s_ranges.push_back(&range);
     }
     if(s_ranges.empty())return;
     select_arena(mem);
@@ -143,6 +176,7 @@ void gx2_write_generations(const uint8_t* mem,Gx2WriteRange* ranges,uint32_t cou
         for(size_t i=first_range;i<end;++i) {
             auto& range=*s_ranges[i];
             range.generation=tracked?newest(range.address/kPage,(uint64_t(range.address)+range.size-1)/kPage):kGx2WriteUntracked;
+            remember_range(mem,range.address,range.size,range.generation);
         }
         first_range=end;
     }
@@ -151,10 +185,11 @@ void gx2_write_watch_begin_batch() {
     if(!reuse_enabled())return;
     t_epoch_reuse=true;
     std::lock_guard lock(s_lock);
+    s_range_generations.clear();
     if(++s_epoch==0)s_epoch=1;  // 0 means "never collected"
 }
 uint64_t gx2_write_query_count(){std::lock_guard lock(s_lock);return s_queries;}
-Gx2WriteWatchStats gx2_write_watch_stats(){std::lock_guard lock(s_lock);return {s_checks,s_queries,s_reused};}
+Gx2WriteWatchStats gx2_write_watch_stats(){std::lock_guard lock(s_lock);return {s_checks,s_queries,s_reused,s_range_hits};}
 bool gx2_write_watch_pending(const uint8_t* mem,uint32_t addr,uint32_t size) {
     if(!mem || !size)return false;
     const uint64_t first=addr/kPage,last=(uint64_t(addr)+size-1)/kPage;

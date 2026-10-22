@@ -17,6 +17,9 @@ namespace rebrewu::codegen {
     bool use_goto{true};               // use goto for block jumps (vs setjmp)
     uint32_t functions_per_file{500};  // 0 = all in one file
     std::string runtime_header{"rebrewu_runtime.h"};
+    // Entries whose callers reach a wrapper that runs a registered host hook
+    // (rbrew_guest_hook) or, with none registered, the original body.
+    std::set<uint32_t> hooked;
   };
 
   class CppEmitter {

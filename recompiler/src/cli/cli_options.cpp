@@ -74,6 +74,8 @@ std::optional<CliOptions> parse(int argc, char** argv) {
             opts.config_path = argv[++i];
         } else if (arg == "--analyzer-entries" && i + 1 < argc) {
             opts.analyzer_entries_file = argv[++i];
+        } else if (arg == "--hooks" && i + 1 < argc) {
+            opts.hooks_file = argv[++i];
         } else if (arg == "--hints-file" && i + 1 < argc) {
             opts.hints_file = argv[++i];
         } else if (arg == "--emit-ppc-image") {

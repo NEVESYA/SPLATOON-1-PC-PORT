@@ -2,6 +2,7 @@
 #include "../../../runtime/texture_diagnostics.h"
 #include "gx2_vk.h"
 #include "gx2_vk_memory.h"
+#include "gx2_fps_overlay.h"
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <SDL_vulkan.h>
@@ -65,7 +66,11 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
     if (error) s_last_validation_error = data && data->pMessage ? data->pMessage : "";
     // Bounded: the first messages of each class, then powers of two.
     if (count <= 32 || (count & (count - 1)) == 0)
+#ifdef RBREW_ADVANCED_TESTS
+        std::fprintf(stderr, "[vk] %s #%llu: %s\n", error ? "VALIDATION ERROR" : "validation warning",
+#else
         RBREW_LOGF(stderr, "[vk] %s #%llu: %s\n", error ? "VALIDATION ERROR" : "validation warning",
+#endif
                      static_cast<unsigned long long>(count), data && data->pMessage ? data->pMessage : "");
     return VK_FALSE;
 }
@@ -257,6 +262,7 @@ struct Swapchain {
 Swapchain s_swapchain;
 uint64_t s_presents = 0;
 bool s_capture_presents = false;
+bool s_capture_overlay = false;   // tests: keep the FPS overlay in captured presents
 std::vector<uint8_t> s_last_present;
 uint32_t s_last_present_w = 0, s_last_present_h = 0;
 
@@ -406,6 +412,7 @@ struct Real {
     PFN_vkCmdSetDepthBiasEnable SetDepthBiasEnable; PFN_vkCmdSetPrimitiveRestartEnable SetPrimitiveRestartEnable;
     PFN_vkCmdSetBlendConstants SetBlendConstants; PFN_vkCmdDraw Draw; PFN_vkCmdDrawIndexed DrawIndexed;
     PFN_vkCmdBeginQuery BeginQuery; PFN_vkCmdEndQuery EndQuery; PFN_vkCmdBeginRendering BeginRendering; PFN_vkCmdEndRendering EndRendering;
+    PFN_vkCmdWriteTimestamp WriteTimestamp; PFN_vkCmdWriteTimestamp2 WriteTimestamp2; PFN_vkCmdResetQueryPool ResetQueryPool;
     PFN_vkCmdPipelineBarrier2 PipelineBarrier2; PFN_vkCmdPipelineBarrier PipelineBarrier; PFN_vkCmdClearAttachments ClearAttachments;
     // Drain-then-direct.
     PFN_vkCmdCopyImage CopyImage; PFN_vkCmdCopyImageToBuffer CopyImageToBuffer; PFN_vkCmdBlitImage BlitImage;
@@ -482,6 +489,9 @@ void recorder() {
 
 // Producer side (the render thread). Returns the packet body (16-aligned).
 uint64_t s_head = 0;   // producer's private head
+uint64_t s_published_head = 0;
+uint32_t s_batch_depth = 0;
+void publish();
 uint8_t* reserve(size_t body, Replay fn) {
     Ring& r = *s_ring;
     const size_t size = 16 + align16(body);
@@ -499,10 +509,14 @@ uint8_t* reserve(size_t body, Replay fn) {
             s_head += size;
             return p + 16;
         }
+        // A large/nested batch can fill the ring before its scope ends.
+        // Publish only fully constructed earlier packets before waiting.
+        if(s_published_head!=s_head)publish();
         _mm_pause();   // ring full: the recording thread is catching up
     }
 }
 void publish() {
+    s_published_head=s_head;
     s_ring->head.store(s_head, std::memory_order_seq_cst);
     if (s_ring->sleeping.load(std::memory_order_seq_cst)) s_ring->head.notify_one();
 }
@@ -510,6 +524,7 @@ bool deferring() { return s_active.load(std::memory_order_relaxed); }
 // Wait until every published packet is recorded.
 void drain() {
     if (!s_active.load(std::memory_order_acquire)) return;
+    if(s_published_head!=s_head)publish();
     Ring& r = *s_ring;
     if (r.tail.load(std::memory_order_acquire) == s_head) return;
     for (unsigned n = 0; n < 2048; ++n) { if (r.tail.load(std::memory_order_acquire) == s_head) return; _mm_pause(); }
@@ -526,7 +541,7 @@ template<class Make> void defer(size_t extra, Make make) {
     static_assert(std::is_trivially_copyable_v<F>);
     uint8_t* body = reserve(align16(sizeof(F)) + extra, &thunk<F>);
     new (body) F(make(body + align16(sizeof(F))));
-    publish();
+    if(!s_batch_depth)publish();
 }
 // Copies `count` elements to the cursor and returns the copy (null for none).
 template<class T> const T* put(uint8_t*& cursor, const T* src, uint32_t count) {
@@ -562,6 +577,9 @@ RBREW_DEFER0(Draw, (VkCommandBuffer cb, uint32_t v, uint32_t i, uint32_t fv, uin
 RBREW_DEFER0(DrawIndexed, (VkCommandBuffer cb, uint32_t n, uint32_t i, uint32_t fi, int32_t vo, uint32_t fin), (cb, n, i, fi, vo, fin))
 RBREW_DEFER0(BeginQuery, (VkCommandBuffer cb, VkQueryPool p, uint32_t q, VkQueryControlFlags f), (cb, p, q, f))
 RBREW_DEFER0(EndQuery, (VkCommandBuffer cb, VkQueryPool p, uint32_t q), (cb, p, q))
+RBREW_DEFER0(WriteTimestamp, (VkCommandBuffer cb, VkPipelineStageFlagBits s, VkQueryPool p, uint32_t q), (cb, s, p, q))
+RBREW_DEFER0(WriteTimestamp2, (VkCommandBuffer cb, VkPipelineStageFlags2 s, VkQueryPool p, uint32_t q), (cb, s, p, q))
+RBREW_DEFER0(ResetQueryPool, (VkCommandBuffer cb, VkQueryPool p, uint32_t first, uint32_t count), (cb, p, first, count))
 RBREW_DEFER0(EndRendering, (VkCommandBuffer cb), (cb))
 #undef RBREW_DEFER0
 
@@ -766,6 +784,7 @@ void install() {
     H(SetDepthCompareOp); H(SetStencilTestEnable); H(SetStencilOp); H(SetStencilCompareMask); H(SetStencilWriteMask);
     H(SetStencilReference); H(SetDepthBias); H(SetDepthBiasEnable); H(SetPrimitiveRestartEnable); H(SetBlendConstants);
     H(Draw); H(DrawIndexed); H(BeginQuery); H(EndQuery); H(BeginRendering); H(EndRendering); H(PipelineBarrier2);
+    H(WriteTimestamp); H(WriteTimestamp2); H(ResetQueryPool);
     H(PipelineBarrier); H(ClearAttachments); H(CopyImage); H(CopyImageToBuffer); H(BlitImage); H(CopyBufferToImage);
     H(ClearColorImage); H(ClearDepthStencilImage); H(Dispatch); H(BeginTransformFeedbackEXT); H(EndTransformFeedbackEXT);
     H(BindTransformFeedbackBuffersEXT);
@@ -777,6 +796,7 @@ void install() {
     if (!s_ring) s_ring = new Ring;   // reused across re-initialization
     s_ring->head.store(s_head, std::memory_order_relaxed);
     s_ring->tail.store(s_head, std::memory_order_relaxed);
+    s_published_head=s_head;s_batch_depth=0;
     s_exit = false;
     s_recorder.thread = std::thread(recorder);
     s_active = true;
@@ -787,6 +807,7 @@ void stop() {
     s_exit = true;
     // A sleeping recorder wakes only when head changes: publish a no-op.
     defer(0, [](uint8_t*) { return [] {}; });
+    publish();
     s_ring->head.notify_all();
     s_recorder.thread.join();
     s_active = false;
@@ -794,6 +815,20 @@ void stop() {
 }  // namespace record
 
 }  // namespace
+
+bool begin_command_batch() {
+    if(!record::deferring())return false;
+    ++record::s_batch_depth;return true;
+}
+// Each publication moves the shared head cache line to the recording thread
+// (about 5% of a populated scene's draw time). Closed draw batches are handed
+// over in chunks instead; drain() publishes the rest before every submission,
+// direct command or wait, so recording order and content are unchanged. The
+// chunk is far below the recorder's spin window, so it does not fall asleep.
+constexpr uint64_t kPublishChunk = 16u << 10;
+void end_command_batch() {
+    if(!--record::s_batch_depth && record::s_head-record::s_published_head>=kPublishChunk)record::publish();
+}
 
 // ---------------------------------------------------------------------------
 // Initialization
@@ -826,9 +861,11 @@ bool init(SDL_Window* window, bool native_depth) {
     s_debug_utils = has_extension(available, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     // RBREW_VK_VALIDATION=1 enables the Khronos layer, =sync adds
     // synchronization validation. Tests enable it explicitly.
-#ifdef RBREW_TEXTURE_DIAGNOSTICS
+#if defined(RBREW_TEXTURE_DIAGNOSTICS) || defined(RBREW_ADVANCED_TESTS)
     const char* validation_mode = std::getenv("RBREW_VK_VALIDATION");
+#ifdef RBREW_TEXTURE_DIAGNOSTICS
     if(!validation_mode)validation_mode="sync";
+#endif
 #ifdef RBREW_TEXTURE_DIAG_LAYER_PATH
     if(!std::getenv("VK_ADD_LAYER_PATH"))_putenv_s("VK_ADD_LAYER_PATH",RBREW_TEXTURE_DIAG_LAYER_PATH);
 #endif
@@ -1839,6 +1876,52 @@ bool has_surface() { return s_surface != VK_NULL_HANDLE; }
 uint64_t present_count() { return s_presents; }
 VkPresentModeKHR present_mode() { return s_swapchain.mode; }
 
+std::atomic<bool> s_fps_overlay{[] { const char* v = std::getenv("RBREW_FPS_OVERLAY"); return !(v && v[0] == '0'); }()};
+overlay::Stats s_fps_stats;
+void set_fps_overlay(bool visible) { s_fps_overlay.store(visible, std::memory_order_relaxed); }
+bool fps_overlay() { return s_fps_overlay.load(std::memory_order_relaxed); }
+// Opaque 32-bit texels of the swapchain format, or false for other formats.
+static bool overlay_colors(VkFormat format, uint32_t& white, uint32_t& black) {
+    switch (format) {
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_A8B8G8R8_UNORM_PACK32: case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+        white = 0xFFFFFFFFu; black = 0xFF000000u; return true;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+        white = 0xFFFFFFFFu; black = 0xC0000000u; return true;
+    default: return false;
+    }
+}
+// Copies the overlay strip into `target` (TRANSFER_DST_OPTIMAL, just written
+// by the frame's blit) at its top-left corner.
+static void draw_fps_overlay(VkCommandBuffer cb, VkImage target, VkExtent2D extent) {
+    uint32_t white, black;
+    if (!overlay_colors(s_swapchain.format, white, black)) return;
+    const unsigned scale = std::max(2u, extent.height / 360);
+    unsigned width, height;
+    overlay::strip_size(s_fps_stats.text(), scale, width, height);
+    const unsigned margin = 2 * scale;
+    if (width + margin > extent.width || height + margin > extent.height) return;
+    const Span span = upload(VkDeviceSize(width) * height * 4, 16);
+    if (!span.data) return;
+    overlay::rasterize(s_fps_stats.text(), scale, white, black, reinterpret_cast<uint32_t*>(span.data), width, height);
+    VkImageMemoryBarrier2 after_blit{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    after_blit.srcStageMask = after_blit.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    after_blit.srcAccessMask = after_blit.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    after_blit.oldLayout = after_blit.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    after_blit.srcQueueFamilyIndex = after_blit.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    after_blit.image = target;
+    after_blit.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.imageMemoryBarrierCount = 1; dependency.pImageMemoryBarriers = &after_blit;
+    vkCmdPipelineBarrier2(cb, &dependency);
+    VkBufferImageCopy region{};
+    region.bufferOffset = span.offset;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageOffset = {int32_t(margin), int32_t(margin), 0};
+    region.imageExtent = {width, height, 1};
+    vkCmdCopyBufferToImage(cb, span.buffer, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+}
+
 bool present(Image& source, uint32_t width, uint32_t height) {
     if (s_capture_presents) { s_last_present.clear(); s_last_present_w = s_last_present_h = 0; }
     leave_rendering();
@@ -1894,6 +1977,9 @@ bool present(Image& source, uint32_t width, uint32_t height) {
     } else {
         vkCmdClearColorImage(cb, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
     }
+    s_fps_stats.presented(overlay::Stats::Clock::now());
+    // Captured presents feed exact image tests: they never carry the overlay.
+    if ((!s_capture_presents || s_capture_overlay) && fps_overlay()) draw_fps_overlay(cb, target, s_swapchain.extent);
     VkImageLayout last_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     Buffer readback;
     const VkExtent2D extent = s_swapchain.extent;
@@ -2012,6 +2098,7 @@ void set_name(VkObjectType type, uint64_t handle, const char* name) {
 
 namespace gx2vk {
 bool capture_presents(bool enable) { const bool previous = s_capture_presents; s_capture_presents = enable; return previous; }
+void capture_fps_overlay(bool include) { s_capture_overlay = include; }
 bool last_present(std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height) {
     if (s_last_present.empty()) return false;
     rgba = s_last_present; width = s_last_present_w; height = s_last_present_h;

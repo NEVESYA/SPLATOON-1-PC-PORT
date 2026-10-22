@@ -62,6 +62,9 @@ Keyboard and mouse:
 | G | Options (−) |
 | Esc | Home |
 | Tab | GamePad view (the mouse becomes the touch screen) |
+| F3 | Show/hide the FPS overlay (FPS, average frame time, slowest frame of the last half second) |
+
+Standing still with your weapon for about 5 seconds plays the inkling's look-around idle animation (`WaitHold_Nrml_LookAround`). It ships in the game's files but the original game never uses it. Set `RBREW_IDLE_LOOKAROUND=0` to turn it off.
 
 ## Why this project is legal
 

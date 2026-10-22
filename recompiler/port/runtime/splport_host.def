@@ -13,3 +13,5 @@ EXPORTS
     rbrew_call_indirect
     rbrew_call
     rbrew_register_func
+    rbrew_guest_hook
+    rbrew_set_guest_hook

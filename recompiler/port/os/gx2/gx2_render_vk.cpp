@@ -10,6 +10,7 @@
 #include "gx2_render.h"
 #include "gx2_pm4_state.h"
 #include "gx2_detile.h"
+#include "gx2_endian.h"
 #include "gx2_surface.h"
 #include "gx2_surface_layout.h"
 #include "r700_to_glsl.h"
@@ -326,6 +327,21 @@ static uint32_t gx2_blend_equation(uint32_t c) {
 // ---------------------------------------------------------------------------
 // Image helpers (outside a rendering instance)
 // ---------------------------------------------------------------------------
+static void upload_image_span(gx2vk::Image& image, uint32_t level, uint32_t first_layer, uint32_t layers,
+                              uint32_t width, uint32_t height, uint32_t depth, const gx2vk::Span& span,
+                              VkImageAspectFlags aspect = 0) {
+    if(!image.image || !span.data || !span.size)return;
+    end_rendering();
+    TXDIAG(txdiag::upload(image,level,first_layer,layers,span.data,size_t(span.size),txdiag::handle(span.buffer),span.offset));
+    const auto cb=gx2vk::cmd();gx2vk::barrier_if_dirty();
+    VkBufferImageCopy region{};region.bufferOffset=span.offset;
+    region.imageSubresource={aspect?aspect:(image.aspect&VK_IMAGE_ASPECT_DEPTH_BIT?VK_IMAGE_ASPECT_DEPTH_BIT:image.aspect),
+        level,image.desc.type==VK_IMAGE_TYPE_3D?0u:first_layer,image.desc.type==VK_IMAGE_TYPE_3D?1u:layers};
+    region.imageExtent={width,height,image.desc.type==VK_IMAGE_TYPE_3D?std::max(1u,depth):1u};
+    vkCmdCopyBufferToImage(cb,span.buffer,image.image,VK_IMAGE_LAYOUT_GENERAL,1,&region);
+    gx2vk::note_gpu_write(image);
+}
+
 void gx2r::upload_image_level(gx2vk::Image& image, uint32_t level, uint32_t first_layer, uint32_t layers,
                               uint32_t width, uint32_t height, uint32_t depth, const uint8_t* data, size_t bytes,
                               VkImageAspectFlags aspect) {
@@ -344,17 +360,8 @@ void gx2r::upload_image_level(gx2vk::Image& image, uint32_t level, uint32_t firs
         TXDIAG(txdiag::event("upload_failed","\"image\":%llu,\"mip\":%u,\"bytes\":%zu",txdiag::handle(image.image),level,bytes));
         return;
     }
-    TXDIAG(txdiag::upload(image,level,first_layer,layers,data,bytes,txdiag::handle(span.buffer),span.offset));
     std::memcpy(span.data, data, bytes);
-    VkCommandBuffer cb = gx2vk::cmd();
-    gx2vk::barrier_if_dirty();
-    VkBufferImageCopy region{};
-    region.bufferOffset = span.offset;
-    region.imageSubresource = {aspect ? aspect : (image.aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : image.aspect),
-                               level, image.desc.type == VK_IMAGE_TYPE_3D ? 0u : first_layer, image.desc.type == VK_IMAGE_TYPE_3D ? 1u : layers};
-    region.imageExtent = {width, height, image.desc.type == VK_IMAGE_TYPE_3D ? std::max(1u, depth) : 1u};
-    vkCmdCopyBufferToImage(cb, span.buffer, image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-    gx2vk::note_gpu_write(image);
+    upload_image_span(image,level,first_layer,layers,width,height,depth,span,aspect);
 }
 bool gx2r::shadow_log() {
     static const bool on = [] {
@@ -1220,11 +1227,17 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
 
     auto& cached = S.texture_entries[slot];
     if (!cached.entry || cached.mem != mem || std::memcmp(cached.layout.data(), data, cached.layout.size()) != 0) {
-        ++C.texture_entry_searches;
-        cached.entry = &S.tex_map[texture_image_key(mem, data)];
+        TextureEntryIndexKey index_key{mem};
+        std::memcpy(index_key.layout.data(), data, index_key.layout.size());
+        auto [indexed, inserted] = S.texture_entry_index.try_emplace(index_key, nullptr);
+        if (inserted) {
+            ++C.texture_entry_searches;
+            indexed->second = &S.tex_map[texture_image_key(mem, data)];
+        }
+        cached.entry = indexed->second;
         TXDIAG(txdiag::count(txdiag::Misses));
         cached.mem = mem;
-        std::memcpy(cached.layout.data(), data, cached.layout.size());
+        cached.layout = index_key.layout;
     }
     auto& entry = *cached.entry;
     if (!entry.tex.id) {
@@ -1439,9 +1452,15 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
         entry.width = w; entry.height = h; entry.layers = layers; entry.format = fmt; entry.mip_levels = mip_levels;
         const auto vf = gx2_vk_format(fmt);
         const uint8_t* pixels = rbrew_memory_accessible(mem, img_ptr, img_sz ? img_sz : 1) ? (mem + img_ptr) : nullptr;
+        // Storage must exist before reserving decode output. The existing
+        // mapped ring owns the bytes until submission completion, including
+        // every helper-thread write. No temporary linear texture is needed.
+        const bool storage_ok=(!vf.compressed || pixels) && (target!=wire::TEXTURE_CUBE_MAP_ARRAY || layers%6==0);
+        const bool storage_ready=storage_ok && ensure_texture_storage(entry,target,vf.format,w,h,layers,mip_levels,vf.depth);
         std::vector<uint8_t> linear;
+        gx2vk::Span decoded_span;
         bool detiled = false;
-        if (pixels && !vf.depth) {
+        if (pixels && img_sz && !vf.depth && storage_ready) {
             Gx2DetileDesc d;
             d.width = vf.compressed ? (w + 3) / 4 : w;
             d.height = vf.compressed ? (h + 3) / 4 : h;
@@ -1452,9 +1471,13 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
             RbrewGx2SurfaceDesc sd{dim, w, h, surface_layers, 1, fmt, 0, descriptor_word(data, GX2SURF_USE), d.tile_mode, d.swizzle};
             if (const auto layout = rbrew_gx2_calc_surface_layout(sd)) d.surface_height = layout->padded_height;
             const size_t slice_bytes = size_t(d.width) * d.height * (d.bits_per_element / 8);
-            linear.resize(slice_bytes * layers);
-            detiled = !linear.empty();
-            for (unsigned z = 0; z < layers && detiled; ++z) { d.slice = first_slice + z; detiled = gx2_detile_mip0(d, pixels, img_sz, linear.data() + z * slice_bytes); }
+            decoded_span=gx2vk::upload(slice_bytes*layers,16);
+            // Retain the established path if mapped storage could not be
+            // obtained; allocation failures must not change decode semantics.
+            if(!decoded_span.data)linear.resize(slice_bytes*layers);
+            uint8_t* output=decoded_span.data?decoded_span.data:linear.data();
+            detiled = slice_bytes && layers && output;
+            for (unsigned z = 0; z < layers && detiled; ++z) { d.slice = first_slice + z; detiled = gx2_detile_mip0(d, pixels, img_sz, output + z * slice_bytes); }
             static unsigned s_logged_uploads;
             if (s_logged_uploads < 40) {
                 ++s_logged_uploads;
@@ -1467,31 +1490,42 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
         }
         // GPU: compressed level 0 without CPU data is never specified; a
         // CUBE_MAP_ARRAY needs a multiple of six layer-faces.
-        bool storage_ok = true;
         TXDIAG(txdiag::event("decode","\"cache_id\":%u,\"address\":%u,\"format\":%u,\"width\":%u,\"height\":%u,\"layers\":%u,\"mips\":%u,\"pixels\":%s,\"detiled\":%s",entry.tex.id,img_ptr,fmt,w,h,layers,mip_levels,pixels?"true":"false",detiled?"true":"false"));
-        if (vf.compressed && !pixels) storage_ok = false;
-        if (target == wire::TEXTURE_CUBE_MAP_ARRAY && (layers % 6) != 0) storage_ok = false;
-        if (storage_ok && ensure_texture_storage(entry, target, vf.format, w, h, layers, mip_levels, vf.depth)) {
+        if (storage_ready) {
             entry.tex.view_format = vf.format;
             entry.tex.levels = mip_levels; entry.tex.layers = layers;
             entry.tex.integer = vf.integer; entry.tex.depth = vf.depth; entry.tex.compressed = vf.compressed;
             entry.tex.complete_storage = true;
-            const uint8_t* level0 = detiled ? linear.data() : pixels;
+            const uint8_t* level0 = detiled ? (decoded_span.data?decoded_span.data:linear.data()) : pixels;
             const uint32_t bw = vf.compressed ? (w + 3) / 4 : w, bh = vf.compressed ? (h + 3) / 4 : h;
             const size_t level0_bytes = size_t(bw) * bh * (vf.compressed ? vf.block : vf.bpp) * layers;
             if (vf.depth) {
                 clear_image_depth(entry.image, 0.0f, 0);    // GPU allocates depth textures without data
+            } else if(detiled && decoded_span.data) {
+                upload_image_span(entry.image,0,0,layers,w,h,layers,decoded_span);
             } else if (level0 && (detiled || !vf.compressed || target != wire::TEXTURE_2D || level0_bytes <= img_sz)) {
                 // Undetiled CPU bytes are uploaded as GPU would (they may be short).
                 if (!detiled && img_sz > 0 && img_sz < level0_bytes) {
-                    std::vector<uint8_t> padded(level0_bytes);
-                    std::memcpy(padded.data(), level0, img_sz);
-                    upload_image_level(entry.image, 0, 0, layers, w, h, layers, padded.data(), level0_bytes, 0);
+                    if(decoded_span.data) {
+                        // The failed decode's reservation already has exactly
+                        // this size. Reuse it for the padded legacy upload.
+                        std::memcpy(decoded_span.data,level0,img_sz);
+                        std::memset(decoded_span.data+img_sz,0,level0_bytes-img_sz);
+                        upload_image_span(entry.image,0,0,layers,w,h,layers,decoded_span);
+                    } else {
+                        std::vector<uint8_t> padded(level0_bytes);
+                        std::memcpy(padded.data(), level0, img_sz);
+                        upload_image_level(entry.image, 0, 0, layers, w, h, layers, padded.data(), level0_bytes, 0);
+                    }
                 } else {
                     // As in GPU, a zero imageSize does not cap the unpacked
                     // texel upload. Validate the actual range before reading.
-                    if (detiled || rbrew_memory_accessible(mem, img_ptr, uint32_t(level0_bytes)))
-                        upload_image_level(entry.image, 0, 0, layers, w, h, layers, level0, level0_bytes, 0);
+                    if (detiled || rbrew_memory_accessible(mem, img_ptr, uint32_t(level0_bytes))) {
+                        if(decoded_span.data) {
+                            std::memcpy(decoded_span.data,level0,level0_bytes);
+                            upload_image_span(entry.image,0,0,layers,w,h,layers,decoded_span);
+                        } else upload_image_level(entry.image, 0, 0, layers, w, h, layers, level0, level0_bytes, 0);
+                    }
                 }
             } else {
                 clear_image_color(entry.image, zero_color());
@@ -1505,6 +1539,7 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
             const auto layout = rbrew_gx2_calc_surface_layout(sd);
             const uint32_t mip_ptr = descriptor_word(data, GX2SURF_MIPMAPS), mip_bytes = descriptor_word(data, GX2SURF_MIPMAP_SIZE);
             for (uint32_t level = 1; level < mip_levels; ++level) {
+                if(vf.depth)continue;
                 const auto mw = std::max(1u, w >> level), mh = std::max(1u, h >> level), ml = dim == 2 ? std::max(1u, layers >> level) : layers;
                 const uint32_t offset = level == 1 ? 0 : descriptor_word(data, GX2SURF_MIP_OFFSETS + 4 * (level - 1));
                 std::vector<uint8_t> decoded;
@@ -1513,18 +1548,20 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
                 d.width = vf.compressed ? (mw + 3) / 4 : mw; d.height = vf.compressed ? (mh + 3) / 4 : mh;
                 d.bits_per_element = (vf.compressed ? vf.block : vf.bpp) * 8;
                 const size_t plane = size_t(d.width) * d.height * (d.bits_per_element / 8);
+                const auto span=gx2vk::upload(plane*ml,16);
+                if(!span.data)decoded.resize(plane*ml);
+                uint8_t* output=span.data?span.data:decoded.data();
                 if (!vf.depth && layout && mip_ptr && offset < mip_bytes && rbrew_memory_accessible(mem, mip_ptr, mip_bytes)) {
                     d.pitch = layout->level_pitch[level]; d.surface_height = layout->level_height[level]; d.tile_mode = layout->level_tile[level];
                     d.swizzle = sd.swizzle;
-                    decoded.resize(plane * ml); bool ok = true;
-                    for (unsigned z = 0; z < ml && ok; ++z) { d.slice = first_slice + z; ok = gx2_detile_mip0(d, mem + mip_ptr + offset, mip_bytes - offset, decoded.data() + z * plane); }
-                    if (ok) source = decoded.data();
+                    bool ok = output!=nullptr;
+                    for (unsigned z = 0; z < ml && ok; ++z) { d.slice = first_slice + z; ok = gx2_detile_mip0(d, mem + mip_ptr + offset, mip_bytes - offset, output + z * plane); }
+                    if (ok) source = output;
                 }
-                if (vf.depth) continue;
                 TXDIAG(if(!source)txdiag::event("mip_decode_failed","\"cache_id\":%u,\"mip\":%u,\"mip_address\":%u,\"mip_bytes\":%u,\"offset\":%u",entry.tex.id,level,mip_ptr,mip_bytes,offset));
-                std::vector<uint8_t> empty;
-                if (!source) { empty.resize(plane * ml); source = empty.data(); }
-                upload_image_level(entry.image, level, 0, ml, mw, mh, ml, source, plane * ml, 0);
+                if(!source && output)std::memset(output,0,plane*ml);
+                if(span.data)upload_image_span(entry.image,level,0,ml,mw,mh,ml,span);
+                else upload_image_level(entry.image,level,0,ml,mw,mh,ml,output,plane*ml,0);
             }
             entry.tex.params.max_level = mip_levels - 1;
             if (mip_levels > 1) entry.tex.params.min_filter = vf.integer ? wire::NEAREST_MIPMAP_NEAREST : wire::LINEAR_MIPMAP_LINEAR;
@@ -2139,6 +2176,7 @@ void gx2_render_save_fetch_shader(uint32_t fs_addr, uint32_t attrib_count, uint3
     // per attribute); a later change means another program was loaded there.
     const uint32_t size = 16 + attrib_count * 16;
     if (rbrew_memory_accessible(mem, fs_addr, size)) fetch.program.assign(mem + fs_addr, mem + fs_addr + size);
+    fetch.revision=S.next_fetch_revision++;
     S.fetch_shaders[fs_addr] = std::move(fetch);
 }
 void gx2_render_set_active_fetch_shader(uint32_t fs_addr) {
@@ -2151,6 +2189,7 @@ void gx2_render_store_fetch_attributes(uint32_t program, const std::vector<R700F
     if (!program || attributes.empty()) return;
     auto& fetch = S.fetch_shaders[program];
     fetch.attributes = attributes;
+    fetch.revision=S.next_fetch_revision++;
     fetch.program.clear();
 }
 void gx2_render_store_fetch_attributes(uint32_t program, const std::vector<R700FetchAttribute>& attributes,
@@ -2164,6 +2203,7 @@ void gx2_render_store_fetch_attributes(uint32_t program, const std::vector<R700F
     }
     auto& fetch = it != S.fetch_shaders.end() ? it->second : S.fetch_shaders[program];
     fetch.attributes = attributes;
+    fetch.revision=S.next_fetch_revision++;
     fetch.program.assign(bytes, bytes + size);
 }
 bool gx2_render_fetch_program_current(uint32_t program, const uint8_t* bytes, uint32_t size) {
@@ -2196,9 +2236,9 @@ void gx2_render_set_pixel_shader(uint32_t ps_addr, uint8_t* mem) {
 void gx2_render_set_uniform_reg(bool is_pixel, uint32_t index, uint32_t src_addr, uint32_t count, uint8_t* mem) {
     // gx2.rpl 0202f608/0202f754: offset and count are DWORD units.
     if (!src_addr || !count || count > 1024 || !rbrew_memory_accessible(mem, src_addr, uint64_t(count) * 4)) return;
-    std::vector<uint32_t> words(count);
-    for (unsigned i = 0; i < count; ++i) words[i] = rbrew_read32(mem, src_addr + i * 4);
-    gx2_render_set_uniform_words(is_pixel, index, words.data(), count);
+    index &= 0x7fff;
+    if(index>=1024 || count>1024-index)return;
+    gx2_copy_be_words(S.uniform_words[is_pixel].data()+index,mem+src_addr,count);
 }
 void gx2_render_set_uniform_words(bool is_pixel, uint32_t index, const uint32_t* words, uint32_t count) {
     index &= 0x7FFF;

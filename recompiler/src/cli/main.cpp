@@ -211,6 +211,21 @@ int main(int argc, char** argv) {
     codegen::NamingContext names(rpx.name);
     codegen::EmitConfig emit_config;
     emit_config.emit_ppc_image = opts->emit_ppc_image;
+    if (!opts->hooks_file.empty()) {
+        std::ifstream hooks(opts->hooks_file);
+        if (!hooks) { std::cerr << "cannot read hooks " << opts->hooks_file << std::endl; return EXIT_FAILURE; }
+        for (std::string line; std::getline(hooks, line);) {
+            const auto hex = line.substr(0, line.find_first_of("# \t\r"));
+            if (hex.empty()) continue;
+            try { emit_config.hooked.insert(uint32_t(std::stoul(hex, nullptr, 16))); }
+            catch (...) { std::cerr << "invalid hook address " << line << std::endl; return EXIT_FAILURE; }
+        }
+        for (uint32_t addr : emit_config.hooked)
+            if (std::none_of(ir_module.functions.begin(), ir_module.functions.end(), [&](const auto& f) { return f.entry_addr == addr; })) {
+                std::cerr << "hook address " << std::hex << addr << " is not a discovered function entry" << std::endl; return EXIT_FAILURE;
+            }
+        std::cerr << "Hook wrappers: " << emit_config.hooked.size() << std::endl;
+    }
     codegen::CppEmitter emitter(ir_module, rpx, lnk, std::move(names), emit_config);
     if (!emitter.emit(opts->output_dir)) {
         std::cerr << "Code generation failed: " << emitter.last_error() << "\n";

@@ -10,6 +10,7 @@
 #include "../gx2_detile.h"
 #include "../r700_to_glsl.h"
 #include <array>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <set>
@@ -133,6 +134,32 @@ struct TextureEntryCache {
     std::array<uint8_t, GX2TEX_COMP_MAP> layout{};
     Texture* entry = nullptr;
 };
+// Every slot's cache rule at once: the exact descriptor bytes a slot cache
+// compares (and their memory) name one tex_map entry. Materials rebind many
+// textures per draw, so a slot rarely holds its previous texture; this skips
+// rebuilding the layout key and walking tex_map. Nodes are never erased
+// before the whole State is reset, which also clears this index.
+struct TextureEntryIndexKey {
+    const uint8_t* mem = nullptr;
+    std::array<uint8_t, GX2TEX_COMP_MAP> layout{};
+    bool operator==(const TextureEntryIndexKey&) const = default;
+};
+struct TextureEntryIndexHash {
+    // Descriptors are big-endian, so differing pointer bytes sit high in each
+    // loaded word: rotating rounds and a full avalanche reach the bucket bits.
+    static uint64_t round(uint64_t acc, uint64_t x) { acc += x * 0xC2B2AE3D27D4EB4Full; acc = (acc << 31) | (acc >> 33); return acc * 0x9E3779B185EBCA87ull; }
+    size_t operator()(const TextureEntryIndexKey& k) const noexcept {
+        uint64_t a = reinterpret_cast<uintptr_t>(k.mem), b = 0x61C8864E7A143579ull;
+        for (size_t i = 0; i + 16 <= k.layout.size(); i += 16) {   // two independent lanes; the tail word is below
+            uint64_t x, y; std::memcpy(&x, k.layout.data() + i, 8); std::memcpy(&y, k.layout.data() + i + 8, 8);
+            a = round(a, x); b = round(b, y);
+        }
+        uint32_t tail; std::memcpy(&tail, k.layout.data() + k.layout.size() - 4, 4);
+        uint64_t h = round(a ^ ((b << 27) | (b >> 37)), tail);
+        h ^= h >> 33; h *= 0xFF51AFD7ED558CCDull; h ^= h >> 33; h *= 0xC4CEB9FE1A85EC53ull; h ^= h >> 33;
+        return size_t(h);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Mirrored GPU state.
@@ -214,7 +241,7 @@ struct NativeContextSnapshot {
 // program: the guest fetch-program bytes the layout belongs to (empty when
 // unknown). Scenes reload models into freed memory, so the address alone
 // does not identify a fetch program.
-struct FetchShaderInfo { std::vector<R700FetchAttribute> attributes; std::vector<uint8_t> program; };
+struct FetchShaderInfo { std::vector<R700FetchAttribute> attributes; std::vector<uint8_t> program; uint64_t revision=0; };
 
 // Sampler state of one GX2 sampler slot (stage*18 + slot), as GPU sampler
 // object parameters.
@@ -224,6 +251,7 @@ struct SamplerState { TexParams params; bool valid = false; };
 // Renderer globals (render thread only).
 // ---------------------------------------------------------------------------
 struct State {
+    uint64_t next_fetch_revision=1;
     VkExtent2D display_extent{1280, 720}; // physical desktop pixels, chosen before targets exist
     std::map<ColorImageKey, ColorTarget> cb_map;
     std::map<ColorImageKey, DepthTarget> depth_map;
@@ -233,6 +261,7 @@ struct State {
     ImageViewRanges<ColorTarget> color_ranges;
     ImageViewRanges<DepthTarget> depth_ranges;
     std::array<TextureEntryCache, 96> texture_entries{};
+    std::unordered_map<TextureEntryIndexKey, Texture*, TextureEntryIndexHash> texture_entry_index;
     // Address index of tex_map image/mip ranges for gx2_render_invalidate_textures,
     // rebuilt when tex_map grows (entries are only added, or all reset).
     struct TexRange { uint32_t start; uint64_t end; Texture* entry; };

@@ -30,6 +30,7 @@ $Downloads = Join-Path $Work 'downloads'
 # Only this game executable is supported (Splatoon, Europe, AGMP01, v16).
 $SupportedRpxSha256 = '45ECD1ED81A97F46B1C8AE24820CD47FBC55399B50AF09BF1F9050FE803308E5'
 $BoundaryProfile = Join-Path $Root 'profiles\agmp-v16.entries'
+$HookProfile = Join-Path $Root 'profiles\agmp-v16.hooks'
 $MinimumFunctionCount = 96300
 
 # Open-source build dependencies (official upstream releases).
@@ -407,15 +408,17 @@ Step 'Recompiling your Gambit.rpx into C++ (a few minutes)'
 $generated = Join-Path $Work 'generated\Gambit'
 $stamp = Join-Path $Work 'generated\source.sha256'
 if (-not (Test-Path -LiteralPath $BoundaryProfile -PathType Leaf)) { Fail 'The supported-game boundary profile is missing. Extract the complete repository ZIP, including profiles, and retry.' }
+if (-not (Test-Path -LiteralPath $HookProfile -PathType Leaf)) { Fail 'The supported-game hook profile is missing. Extract the complete repository ZIP, including profiles, and retry.' }
 # The profile is address metadata, not game code. The RPX hash above selects
 # its supported version; RebrewU still validates each boundary against the RPX.
 # Include it in the stamp so incomplete builds made without it regenerate.
-$current = $rpxHash + ':' + (File-Sha256 $rebrewu.FullName) + ':' + (File-Sha256 $BoundaryProfile)
+$current = $rpxHash + ':' + (File-Sha256 $rebrewu.FullName) + ':' + (File-Sha256 $BoundaryProfile) + ':' + (File-Sha256 $HookProfile)
 if (-not ((Complete-GeneratedModule $generated) -and (Test-Path -LiteralPath $stamp) -and ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $current))) {
     # A fresh folder avoids stale parts from an older, larger generation.
     if (Test-Path -LiteralPath (Join-Path $Work 'generated')) { Remove-Item -LiteralPath (Join-Path $Work 'generated') -Recurse -Force }
     Ensure-Folder $generated
-    & $rebrewu.FullName recompile --rpx $rpx --output $generated --analyzer-entries $BoundaryProfile
+    # Hook wrappers let the port attach opt-in host code to listed functions.
+    & $rebrewu.FullName recompile --rpx $rpx --output $generated --analyzer-entries $BoundaryProfile --hooks $HookProfile
     Check-Exit 'Recompiling Gambit.rpx'
     if (-not (Complete-GeneratedModule $generated)) { Fail 'The recompiler did not produce the complete supported-game function table. Installation stopped before building an incomplete game.' }
     Set-Content -LiteralPath $stamp -Value $current -Encoding ASCII

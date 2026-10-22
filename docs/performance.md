@@ -245,3 +245,209 @@ The incremental Release build and all 34 tests passed on each adapter, with all
 five new rendering cases also passing with serial command recording. The built
 binary was copied to `Game/Splatoon.exe` and its hash verified against the build.
 `build/render-verification.json` records the binary/source hashes and final logs.
+
+## Texture and uniform follow-up (2026-10-22)
+
+Macro-tiled decoding and retiling now derive the eight-by-eight pixel address
+offsets once and calculate bank/pipe/tile addresses once per eight texels. Bounds
+checks, partial rows, depth and thick-tile addressing remain intact. Textures
+narrower than eight texels retain their scalar path. Texture levels decode into
+the existing mapped upload ring, avoiding the temporary linear allocation,
+zero-initialization and full-image staging memcpy. Missing mips and failed
+decodes retain their established fallback behavior. Uniform-register updates
+convert directly into native state using baseline SSE2 with a scalar fallback,
+removing the temporary vector and second copy.
+
+Seven alternating runs of distinct, explicitly rebuilt baseline and candidate
+binaries measured 16-upload bursts through the actual texture-binding path:
+
+| 1024×1024 RGBA8, 16 uploads | RTX 4050 before → after | Intel UHD before → after |
+| --- | --- | --- |
+| Linear | 37.058 → 13.573 ms | 39.773 → 16.275 ms |
+| Macro tile 4 | 58.689 → 14.877 ms | 56.839 → 17.273 ms |
+| Thick tile 7 | 84.057 → 35.963 ms | 80.757 → 43.177 ms |
+
+Across the ten tested sizes/layouts, burst time fell 26–75% on RTX and 14–72%
+on Intel. These totals include hashing, CPU conversion, command recording,
+submission and final completion. They are not GPU timestamps or game frame
+times. Uniform API tests (100,000 updates, 16–1,024 words) take 85–93% less time;
+a volatile function pointer prevents IPO from eliminating repeated writes.
+Raw runs, P95/P99 recording latency, memory samples and executable hashes are
+in `build/next-texture-results.json`. The initial comparison accidentally reused
+identical binaries due to preserved source timestamps and was discarded; the
+runner now rejects identical hashes.
+
+Separate CPU tests of 1024×1024 RGBA8 macro layouts 4, 8 and 12 show 53–62%
+less detile time with the existing serial and three-helper configurations, and
+69–74% less retile time. Three alternating runs, each using seven internal
+timing samples, are retained in `build/next-detile-results.json`.
+
+The standalone `gambit_texture_bench` adds 1,452 independent AddrLib layout cases,
+unaligned uniform conversion, asynchronous texture bursts and byte-exact GPU
+checks of compressed mips, selected array slices, cube faces, 3D mips, absent
+mips, short-source fallback and zero image-size descriptors. Existing
+16,384-draw and resource-lifetime tests
+remain enabled. Worker counts, precompilation, caches, resolution, Vulkan memory
+type ranking, and required barriers are unchanged.
+
+Engineering references: [Cemu's staging reservations and flushes](https://github.com/cemu-project/Cemu/blob/main/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp),
+[Dolphin's upload stream](https://github.com/dolphin-emu/dolphin/blob/master/Source/Core/VideoBackends/Vulkan/VKTexture.cpp),
+and [PCSX2's directly mapped texture upload path](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/GS/Renderers/Vulkan/GSTextureVK.cpp).
+No game executable is used by these benchmarks.
+
+All 38 tests passed on both RTX 4050 and Intel UHD; all nine rendering/streaming
+cases also passed on each adapter with serial command recording. The full
+Release rebuild and final incremental build succeeded. The incremental build
+reused all 193 generated guest-code objects. The delivered `Game/Splatoon.exe`
+matches the built executable; `build/next-verification.json` records its hash,
+source hashes and validation logs. One full-build recursion warning matches a
+linked self-call verified statically in the original RPX; its behavior was
+preserved. The actual game was never launched, so in-game FPS and gameplay,
+physics, graphics and audio correctness remain unmeasured.
+
+## Populated-scene follow-up (2026-10-22)
+
+Large, unchanged geometry ranges reuse their exact write generation within the
+existing render-batch epoch. Renderer stores and collections by other threads
+invalidate those answers conservatively; outside-batch callers still collect
+Windows write watch normally. Small uniform ranges retain their direct scan.
+Vertex-fetch plans retain the decoded format/location mapping while checking
+fetch-program revisions and the complete semantic-import register list. Stream
+availability, strides, write generations, buffer lifetime and instance offsets
+remain live on each draw.
+
+Equivalent Vulkan shader interfaces now share descriptor and pipeline layouts.
+The exact key includes descriptor type/count, shader visibility, immutable
+samplers and push-layout flags. Compiler workers synchronize only during layout
+lookup/creation; draws acquire no new lock. Shared ownership and the device
+cache retain layouts through shader compilation, submitted commands and final
+renderer shutdown. This also permits descriptor reuse across compatible material
+programs, preserving draw order.
+
+The authored `heavy`, `heavy_push` and `overdraw` workloads use 1,024 objects,
+2,304 indexed draws per simulated frame, four geometry streams, 64 material
+textures, eight color programs, a shadow program, changing pose uniforms,
+render-target changes and repeated alpha blending. Twelve frames are queued
+without per-frame GPU waits. GPU timestamps bracket rendering; a separate
+readback history checks every submitted frame, followed by 2,048 object/depth
+samples. The overdraw variant doubles the vertex count per draw and increases
+fragment integer work. These are workload proxies, not captured Plaza frames.
+
+Standalone contracts cover overlapping memory ranges, producer writes,
+cross-thread collection, changed imports/strides/fetch programs, missing
+streams, malformed formats, instance divisors, layout compatibility and
+concurrent compiler creation. `run_heavy_benchmarks.py` alternates distinct
+baseline/candidate binaries, verifies output and identical workload counts,
+and records CPU/GPU median, P95/P99, throughput and memory samples separately.
+
+Engineering references: [Cemu's minimal state and vertex-layout separation](https://github.com/cemu-project/Cemu/blob/main/src/Cafe/HW/Latte/Renderer/Vulkan/VulkanRendererCore.cpp),
+[Dolphin's cached vertex loaders](https://github.com/dolphin-emu/dolphin/blob/master/Source/Core/VideoCommon/VertexLoaderManager.cpp),
+and [PCSX2's Vulkan state tracking](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp).
+Scene-level culling, sorting and indirect batching were not guessed from GX2
+draws; the translator lacks the visibility and ordering proofs those require.
+
+Command recording also publishes each draw's existing packets as one batch,
+reducing cross-thread publication and wakeups. Nested scopes, direct operations
+and queue-capacity pressure still publish/drain in order. A 500,001-command
+fixture forces ring wrap, publication during an open batch and submission
+inside nested scopes. Draw order, Vulkan commands and GPU submission policy
+are unchanged. Legacy/synchronization2 timestamps and query resets now use the
+same recording queue, allowing valid GPU timings with split recording enabled.
+Initial timestamp probes bypassed that queue and were discarded after Vulkan
+validation identified the test-harness race. Corrected baseline and candidate
+runs are checked with Khronos synchronization validation.
+
+## Plaza-scale draw path (2026-10-22)
+
+The earlier heavy proxies call the draw helper directly, so they skip guest
+program-key resolution and guest texture binds. The new authored `plaza` case
+goes through `gx2_render_draw_indexed`: 1,664 draws per frame (shadow, opaque,
+blended), 32 register-selected R700 program pairs of 1.5–3.3 KiB, alpha-test and
+far-clip register changes, big-endian guest indices, per-draw uniforms and four
+`gx2_render_bind_texture` calls per colour draw over 64 tile-mode-4 textures. The
+owner's shader cache holds about 49,800 exact keys for about 2,400 SPIR-V modules,
+so program and state combinations vary heavily between draws.
+
+Changes (draw order, workload, shaders, caches and visuals are unchanged):
+
+- The exact-key memo keeps 256 slots chosen by a hash of all key inputs and
+  checks the previous draw's slot first. A hit still compares every input.
+  Bytecode is compared byte for byte unless the page write generations
+  (already trusted for index, vertex and uniform reuse) prove no write since
+  the bytes were last compared. Untracked memory always compares.
+- The SPI_PS_INPUT_CNTL clear no longer searches the register table per word
+  (8% of main-thread time), key registers use one flat gather, and the legacy
+  key's texture words are built only when that key is used.
+- Per-program masks of live uniform banks and texture slots; sampler compare
+  state is touched only when it differs.
+- Pipeline and descriptor-set maps hash with the renderer's KeyHash instead of
+  MSVC's byte-serial FNV; full-key equality is unchanged.
+- An exact descriptor-bytes index maps a bind to its `tex_map` entry, using the
+  per-slot cache's rule for every slot, instead of rebuilding the 33-word key
+  and walking the tree.
+
+Seven alternating runs of distinct baseline/candidate executables, identical
+workloads and output checksums (`build/plaza-benchmark-results.json`):
+
+| Synthetic CPU time per frame | RTX 4050 before → after | Intel UHD before → after |
+| --- | --- | --- |
+| `plaza` median | 3.920 → 1.345 ms | 4.117 → 1.523 ms |
+| `plaza` P99 | 4.231 → 1.584 ms | 4.366 → 1.727 ms |
+| `heavy` median | 3.052 → 2.225 ms | 3.753 → 2.893 ms |
+| `heavy_push` median | 2.556 → 1.923 ms | 2.607 → 2.288 ms |
+| `overdraw` median | 3.358 → 2.398 ms | 3.614 → 2.786 ms |
+
+`plaza` throughput rose from 409k to 1.14M draws/s (RTX) and from 382k to 961k
+draws/s (Intel). In `heavy`/`overdraw` the GPU time dominates (RTX 4.3/13.5 ms,
+Intel 10.6/38.8 ms) and did not change, so their wall time is unchanged. These
+are CPU translation-layer measurements, not game FPS. A cached SPSC ring tail was
+reverted: it was not measurably faster.
+
+`gambit_render_profile` (MSVC) is the same benchmark with an opt-in sampler:
+`RBREW_BENCH_SAMPLE=1`, `RBREW_BENCH_SAMPLE_LINES=<function>`,
+`RBREW_BENCH_SAMPLE_CALLERS=1`, `RBREW_BENCH_FRAMES=<n>`. Configure
+`-DRBREW_GX2_DEBUG_INFO=ON` for renderer function and line names. All 45 tests
+passed on both adapters, the render/streaming suite passed with serial recording,
+and `render_plaza`, `heavy`, `heavy_push`, `contracts`, `lifetime` and `geometry`
+passed Khronos synchronization validation on both. The game was not launched.
+
+### Second draw-path pass and FPS overlay (2026-10-22)
+
+Further changes, with draw order, workload and visuals unchanged:
+
+- Closed draw batches are published to the recording thread in 16 KiB chunks
+  rather than per draw. `drain()` still publishes everything before each
+  submission, direct command or wait, so recorded commands are unchanged.
+- The descriptor-set key is built in a stack buffer and looked up through a
+  transparent `string_view` hash; only a new set's key is copied into the map.
+- Vertex setup visits only the fetch plan's live streams, and the pipeline key
+  buffer is no longer zero-filled before each draw.
+
+Seven alternating runs against the original baseline executable, with
+identical workloads and checksums (`build/plaza2-benchmark-results.json`):
+
+| Synthetic CPU time per frame | RTX 4050 before → after | Intel UHD before → after |
+| --- | --- | --- |
+| `plaza` median / P99 | 3.847 → 1.194 / 4.116 → 1.434 ms | 4.080 → 1.287 / 4.884 → 1.610 ms |
+| `heavy` median | 3.067 → 1.911 ms | 3.728 → 2.613 ms |
+| `heavy_push` median | 2.578 → 1.698 ms | 2.514 → 2.131 ms |
+| `overdraw` median | 3.301 → 2.056 ms | 3.484 → 2.534 ms |
+
+`plaza` reaches 1.25M draws/s on the RTX 4050 and 943k on the Intel UHD. GPU time
+in `heavy`/`overdraw` is unchanged, so their wall time is still GPU-bound. These
+are CPU translation-layer measurements, not game FPS.
+
+**FPS overlay.** Every presented frame shows FPS, average frame time and the
+slowest frame interval of the last half second. These are measured at actual
+swapchain presentation. The text is rasterised on the CPU with a 5×7 font and
+copied into the top-left corner after the frame blit. It needs no shaders or
+render passes and costs one small buffer-to-image copy per frame. Text is
+scaled with window height. The overlay is shown by default, **F3** toggles
+it, and `RBREW_FPS_OVERLAY=0` starts it hidden. Captured presents used by image
+tests omit it. `render_overlay` checks text, statistics and glyph
+rasterisation. `render_overlay_present` presents through a real hidden Vulkan
+window on each adapter and reads back the swapchain image
+(`docs/fps-overlay-example.png`). All 47 tests passed on both adapters, render
+cases also passed with serial recording, and the validated render cases
+(including `overlay_present`) passed synchronization validation. The game was
+not launched.

@@ -49,6 +49,7 @@ namespace rebrewu::cli {
     bool emit_ppc_image{false}; // relocated executable bytes for opt-in fallback
     std::string hints_file; // diagnostic: extra forced entry addresses (hex per line)
     std::string analyzer_entries_file; // external analyzer starts, corroboration only
+    std::string hooks_file; // guest function entries given an opt-in host hook wrapper (hex per line)
   };
 
   std::optional<CliOptions> parse(int argc, char** argv);

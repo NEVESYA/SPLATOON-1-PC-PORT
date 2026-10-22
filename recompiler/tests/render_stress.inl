@@ -142,7 +142,7 @@ void gx2_render_vk_test_stress(bool push,bool churn) {
     s_last_pipeline_lookup.reset();
     for(auto it=s_pipelines.begin();it!=s_pipelines.end();){uint32_t id=0;std::memcpy(&id,it->first.data(),4);
         if(id!=program.id){++it;continue;}if(auto p=await_compile(it->second))vkDestroyPipeline(gx2vk::device(),p,nullptr);it=s_pipelines.erase(it);}
-    vkDestroyPipelineLayout(gx2vk::device(),program.layout,nullptr);vkDestroyDescriptorSetLayout(gx2vk::device(),program.set_layout,nullptr);
+    release_program_layouts(program);
     reset_command_tracking();
     std::printf("{\"correct_pixels\":4096,\"passed\":true}\n");
 }
@@ -165,6 +165,18 @@ void gx2_render_vk_test_binding_contracts() {
     for(auto& i:program.info){i.attribute_locations.fill(-1);i.vk.uniform_buffer_bindings.fill(-1);i.vk.texture_bindings.fill(-1);}
     program.info[1].vk.uniform_vars_binding=7;program.info[1].vk.uniform_buffer_bindings[0]=3;
     require(create_program_layouts(program,false),"contract layout failed");
+    {Program equivalent;equivalent.info=program.info;require(create_program_layouts(equivalent,false),"shared contract layout failed");
+        require(equivalent.layout==program.layout && equivalent.set_layout==program.set_layout,"identical shader interfaces did not share layouts");
+        Program stage;stage.info=program.info;std::swap(stage.info[0].vk,stage.info[1].vk);require(create_program_layouts(stage,false),"stage-visibility layout failed");
+        require(stage.layout!=program.layout,"layout key omitted shader-stage visibility");
+        Program pushed;pushed.info=program.info;require(create_program_layouts(pushed,true),"push contract layout failed");
+        if(pushed.push)require(pushed.layout!=program.layout,"push and ordinary descriptor layouts were conflated");
+        std::array<Program,8> concurrent;std::vector<std::future<bool>> results;
+        for(auto& p:concurrent){p.info=program.info;p.info[1].vk.uniform_vars_binding=11;auto* target=&p;results.push_back(std::async(std::launch::async,[target]{return create_program_layouts(*target,false);}));}
+        for(auto& result:results)require(result.get(),"concurrent layout creation failed");
+        const auto shared=concurrent[0].layout;for(auto& p:concurrent){require(p.layout==shared,"compiler workers created duplicate layouts");release_program_layouts(p);}
+        release_program_layouts(equivalent);release_program_layouts(stage);release_program_layouts(pushed);
+    }
     require(program.dynamic_uniform_bindings.size()==2,"device dynamic UBO limit not respected");
     auto buffer=gx2vk::create_buffer(8192,VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT,gx2vk::MemoryUse::Upload);
     require(buffer.buffer,"contract buffer failed");
@@ -204,6 +216,8 @@ void gx2_render_vk_test_binding_contracts() {
         const auto expected=gx2vk::sampler(info,info.borderColor==VK_BORDER_COLOR_INT_CUSTOM_EXT||info.borderColor==VK_BORDER_COLOR_FLOAT_CUSTOM_EXT?&border:nullptr);
         require(tex_object_sampler(p,shadow,integer)==expected && tex_object_sampler(p,shadow,integer)==expected,"sampler cache changed parameters");}
     gx2vk::destroy_buffer(buffer);require(gx2vk::finish(),"contract cleanup failed");
-    vkDestroyPipelineLayout(gx2vk::device(),program.layout,nullptr);vkDestroyDescriptorSetLayout(gx2vk::device(),program.set_layout,nullptr);reset_command_tracking();
+    release_program_layouts(program);reset_command_tracking();
     std::printf("{\"binding_contracts\":true,\"passed\":true}\n");
 }
+
+#include "heavy_render_stress.inl"

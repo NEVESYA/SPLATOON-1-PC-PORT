@@ -361,6 +361,14 @@ RBREW_HOST_API void rbrew_call(CPUState* cpu, uint32_t guest_addr) noexcept(fals
 // Called by OS stubs to register a host function at a guest address
 RBREW_HOST_API void rbrew_register_func(CPUState* cpu, uint32_t guest_addr, HostFunc fn);
 
+// Opt-in host hooks for guest functions the recompiler wrapped (--hooks).
+// A hook replaces the call; it runs `original` itself to keep the game's
+// behavior. With no hook registered the wrapper calls the original directly.
+typedef void (*RbrewGuestHook)(CPUState* cpu, uint32_t guest_addr, HostFunc original);
+RBREW_HOST_API RbrewGuestHook rbrew_guest_hook(uint32_t guest_addr);
+// Register (or clear with null) before guest code runs; returns false when full.
+RBREW_HOST_API bool rbrew_set_guest_hook(uint32_t guest_addr, RbrewGuestHook hook);
+
 #ifdef __cplusplus
 }
 #endif
