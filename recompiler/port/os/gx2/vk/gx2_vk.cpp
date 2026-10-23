@@ -68,10 +68,11 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
     if (count <= 32 || (count & (count - 1)) == 0)
 #ifdef RBREW_ADVANCED_TESTS
         std::fprintf(stderr, "[vk] %s #%llu: %s\n", error ? "VALIDATION ERROR" : "validation warning",
+                     static_cast<unsigned long long>(count), data && data->pMessage ? data->pMessage : "");
 #else
         RBREW_LOGF(stderr, "[vk] %s #%llu: %s\n", error ? "VALIDATION ERROR" : "validation warning",
-#endif
                      static_cast<unsigned long long>(count), data && data->pMessage ? data->pMessage : "");
+#endif
     return VK_FALSE;
 }
 

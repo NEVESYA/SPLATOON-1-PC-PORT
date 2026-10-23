@@ -1497,27 +1497,33 @@ struct ExactKeyMemo {
     ExactKeyInputs inputs;
     std::vector<uint8_t> vs, ps;
     uint64_t vs_written = kGx2WriteUntracked, ps_written = kGx2WriteUntracked;   // generations proven equal to vs/ps
+    const uint8_t* vs_at = nullptr; const uint8_t* ps_at = nullptr;              // guest bytes those generations describe
     size_t masks = 0;
     uint64_t key = 0, base = 0, canon = 0;
     bool valid = false;
-    static bool same_code(const std::vector<uint8_t>& saved, uint64_t& proven, const uint8_t* live, size_t size, uint64_t written) {
+    // A generation describes writes to one guest range only. Pages collected
+    // by one query share a generation, so another program of the same size
+    // elsewhere can carry an equal or lower one: only the proven range may
+    // skip the byte comparison. Other ranges with identical bytes still match.
+    static bool same_code(const std::vector<uint8_t>& saved, uint64_t& proven, const uint8_t*& proven_at, const uint8_t* live, size_t size,
+                          uint64_t written) {
         if (saved.size() != size) return false;
-        if (written != kGx2WriteUntracked && proven != kGx2WriteUntracked && written <= proven) return true;
+        if (live == proven_at && written != kGx2WriteUntracked && proven != kGx2WriteUntracked && written <= proven) return true;
         if (std::memcmp(saved.data(), live, size) != 0) return false;
-        proven = written;   // the bytes queried at `written` are identical
+        proven = written; proven_at = live;   // the bytes queried at `written` are identical
         return true;
     }
     bool matches(const ExactKeyInputs& current, const uint8_t* vertex, size_t vertex_size, uint64_t vertex_written,
                  const uint8_t* pixel, size_t pixel_size, uint64_t pixel_written) {
         return valid && masks == s_exact_reads.size() && inputs == current &&
-            same_code(vs, vs_written, vertex, vertex_size, vertex_written) && same_code(ps, ps_written, pixel, pixel_size, pixel_written);
+            same_code(vs, vs_written, vs_at, vertex, vertex_size, vertex_written) && same_code(ps, ps_written, ps_at, pixel, pixel_size, pixel_written);
     }
     // Generations must be queried before the bytes are read (gx2_write_watch.h).
     void capture(const ExactKeyInputs& current, const uint8_t* vertex, size_t vertex_size, uint64_t vertex_written,
                  const uint8_t* pixel, size_t pixel_size, uint64_t pixel_written) {
         valid = false;
         vs.assign(vertex, vertex + vertex_size); ps.assign(pixel, pixel + pixel_size);
-        vs_written = vertex_written; ps_written = pixel_written;
+        vs_written = vertex_written; ps_written = pixel_written; vs_at = vertex; ps_at = pixel;
         inputs = current; masks = s_exact_reads.size();
     }
 };
@@ -2576,14 +2582,39 @@ struct IndexKey {
     uint32_t type = 0;  // native width and source endian
     bool operator==(const IndexKey&) const = default;
 };
+// Guest-range cache keys: a full 64-bit finalizer. Buffers of one size at a
+// fixed stride (shape/palette arrays, mesh pools) otherwise share their low
+// bits, and therefore their buckets.
+inline size_t guest_range_hash(const uint8_t* mem, uint64_t range, uint32_t extra) noexcept {
+    uint64_t h = range ^ (uint64_t(extra) << 20) ^ uintptr_t(mem);
+    h ^= h >> 33; h *= 0xFF51AFD7ED558CCDull; h ^= h >> 33; h *= 0xC4CEB9FE1A85EC53ull; h ^= h >> 33;
+    return size_t(h);
+}
 struct IndexKeyHash {
-    size_t operator()(const IndexKey& k) const noexcept {
-        return size_t(k.range ^ (k.range >> 29) ^ uintptr_t(k.mem) ^ (uint64_t(k.type) * 0x9E3779B97F4A7C15ull));
-    }
+    size_t operator()(const IndexKey& k) const noexcept { return guest_range_hash(k.mem, k.range, k.type); }
 };
 struct CachedIndices { gx2vk::Span span; uint64_t written = 0; };
 std::unordered_map<IndexKey, CachedIndices, IndexKeyHash> s_index_spans;
 uint64_t s_index_chunk = 0;
+// Uniform blocks in tracked guest memory: one resident ring copy per guest
+// range and padded size, valid until a write to its pages or chunk reuse.
+struct UniformKey {
+    const uint8_t* mem = nullptr;
+    uint64_t range = 0;  // guest address and byte count
+    uint32_t bytes = 0;  // padded upload size (declared block size)
+    bool operator==(const UniformKey&) const = default;
+};
+struct UniformKeyHash {
+    size_t operator()(const UniformKey& k) const noexcept { return guest_range_hash(k.mem, k.range, k.bytes); }
+};
+struct CachedUniform { gx2vk::Span span; uint64_t written = 0; };
+std::unordered_map<UniformKey, CachedUniform, UniformKeyHash> s_uniform_spans;
+uint64_t s_uniform_chunk = 0;
+// Last answer per stage/bank. A span found or uploaded during the recording
+// in progress stays reserved until that recording completes, so the same
+// range bound again in it needs neither the map lookup nor a chunk check.
+struct UniformSlotMemo { UniformKey key; gx2vk::Span span; uint64_t written = 0, serial = 0; };
+UniformSlotMemo s_uniform_slot_memo[2][16];
 
 #ifndef RBREW_DISABLE_LOGGING
 // RBREW_CACHE_VERIFY=1 (diagnostic copies): every write-watch cache hit is
@@ -2923,6 +2954,56 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
         auto& block = S.uniform_blocks[stage][bank];
         bool bound_now = false;
         if (gl_binding >= 0 && gl_binding < 48 && block.address && block.size && rbrew_memory_accessible(mem, block.address, block.size)) {
+            const uint64_t written = block_generations[bank];
+            const VkDeviceSize declared = VkDeviceSize(vk.uniform_buffer_vec4s[bank]) * 16;
+            const VkDeviceSize bytes = std::max<VkDeviceSize>(std::max<VkDeviceSize>(block.size, declared), 16);
+            if (written != kGx2WriteUntracked) {
+                // Tracked memory: residency follows the guest range, like
+                // index spans, not the bank slot. Characters bind their own
+                // palette/shape blocks to the same banks; a slot cache
+                // re-copied each one whenever draws alternated between
+                // characters or passes. Guest bytes go straight to the ring.
+                const UniformKey key{mem, uint64_t(block.address) << 32 | block.size, uint32_t(bytes)};
+                auto& memo = s_uniform_slot_memo[stage][bank];
+                const uint64_t serial = gx2vk::recording_serial();
+                if (memo.serial == serial && memo.key == key && written <= memo.written) {
+#ifndef RBREW_DISABLE_LOGGING
+                    if (cache_verify_enabled() && memo.span.data)
+                        cache_verify("uniform", mem, block.address, block.size, memo.span.data, mem + block.address, memo.written, written);
+#endif
+                    S.ubo_binding_points[gl_binding] = memo.span;
+                } else if (const auto found = s_uniform_spans.find(key);
+                           found != s_uniform_spans.end() && written <= found->second.written && gx2vk::span_alive(found->second.span)) {
+#ifndef RBREW_DISABLE_LOGGING
+                    if (cache_verify_enabled() && found->second.span.data)
+                        cache_verify("uniform", mem, block.address, block.size, found->second.span.data, mem + block.address, found->second.written, written);
+#endif
+                    S.ubo_binding_points[gl_binding] = found->second.span;
+                    memo = {key, found->second.span, found->second.written, serial};
+                } else {
+                    // An expired span of unchanged bytes is re-staged, not counted as a change.
+                    if (found == s_uniform_spans.end() || written > found->second.written) {
+                        gx2_perf_bytes(kBytesUniformBlock, block.size); ++C.uniform_buffer_uploads;
+                    }
+                    const auto span = gx2vk::upload(bytes, ubo_align);
+                    if (!span.data) return false;
+                    std::memcpy(span.data, mem + block.address, block.size);
+                    if (bytes > block.size) std::memset(span.data + block.size, 0, bytes - block.size);
+                    if (span.chunk_id) {
+                        if (s_uniform_chunk != span.chunk_id) {
+                            std::erase_if(s_uniform_spans, [](const auto& item) { return !gx2vk::span_resident(item.second.span); });
+                            s_uniform_chunk = span.chunk_id;
+                        }
+                        s_uniform_spans[key] = {span, written};
+                    }
+                    S.ubo_binding_points[gl_binding] = span;
+                    memo = {key, span, written, serial};
+                }
+                bound_now = true;
+            }
+        }
+        if (!bound_now && gl_binding >= 0 && gl_binding < 48 && block.address && block.size && rbrew_memory_accessible(mem, block.address, block.size)) {
+            // Untracked memory: compare against the slot's last uploaded bytes.
             const uint64_t written = block_generations[bank];
             const bool same_binding = block.uploaded && block.uploaded_mem == mem && block.uploaded_address == block.address && block.uploaded_size == block.size;
             const bool verify = !same_binding || written == kGx2WriteUntracked || block.written == kGx2WriteUntracked || written > block.written;
@@ -3540,11 +3621,16 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
         bind_instance(cb, prog->layout, base_instance);
         bind_vertices(cb, vb.input.count, vb.buffers, vb.offsets);
         const uint32_t instances = S.draw_first_instance ? 1 : S.draw_instances;
-        GuestStreamOut streamout;
-        if(!streamout.prepare(mem,*prog,xfb,topology,indices.indexed?indices.count:count,instances))return any;
+        // Stream-out state (eight buffer records) exists only for draws that
+        // enable it; prepare() accepts every other draw unchanged.
+        std::optional<GuestStreamOut> streamout;
+        if((S.regs[0xA2AC]&1) && prog->info[0].streamout_mask) {
+            streamout.emplace();
+            if(!streamout->prepare(mem,*prog,xfb,topology,indices.indexed?indices.count:count,instances))return any;
+        }
         if (g_trace_active) frame_trace_begin_query(cb);
         if (hook) hook(true, cb);
-        streamout.begin(cb);
+        if(streamout)streamout->begin(cb);
         if (indices.indexed) {
             bind_indices(cb, indices.span.buffer, indices.span.offset, indices.type);
             vkCmdDrawIndexed(cb, indices.count, instances, 0, int32_t(first_vertex), 0);
@@ -3552,7 +3638,7 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
             vkCmdDraw(cb, count, instances, first_vertex, 0);
         }
         if (hook) hook(false, cb);
-        if(!streamout.finish(cb,mem))return any;
+        if(streamout && !streamout->finish(cb,mem))return any;
         ++C.draws;
         {
             const uint32_t n = indices.indexed ? indices.count : count;
@@ -3576,7 +3662,7 @@ bool issue_draw_program(Program* prog, uint8_t* mem, uint32_t prim, uint32_t cou
         gx2vk::note_gpu_write();
         any = true;
         if (g_trace_active) {
-            const uint32_t fragments = streamout.mask?streamout.fragments:frame_trace_end_query(cb);
+            const uint32_t fragments = streamout && streamout->mask?streamout->fragments:frame_trace_end_query(cb);
             trace_fragments = fragments == ~0u || trace_fragments == ~0u ? ~0u : trace_fragments + fragments;
             if (i + 1 == loops) frame_trace_after_draw(prim, count, trace_fragments);
         }
@@ -4208,6 +4294,8 @@ void gx2r::shutdown_draw_state() {
     for (auto& [key, buffer] : s_vertex_buffers) gx2vk::destroy_buffer(buffer.buffer);
     s_vertex_buffers.clear(); s_vertex_bytes = 0; s_vertex_evict_bucket = 0; s_vertex_stale.clear();
     s_index_spans.clear(); s_index_chunk = 0;
+    s_uniform_spans.clear(); s_uniform_chunk = 0;
+    for (auto& stage : s_uniform_slot_memo) for (auto& memo : stage) memo = {};
     gx2vk::destroy_buffer(s_null_vertex);
     s_zero_ubo = {};
     s_last_sampler={};

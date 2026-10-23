@@ -20,6 +20,13 @@
 #include "rebrewu_ppc_hybrid.h"
 #endif
 
+std::atomic<bool> rbrew_strict_reservations_active{false}; // constant-initialized
+#if defined(_MSC_VER)
+__declspec(thread) bool rbrew_thread_write_observed = false;  // write_observer.callback != null
+#else
+thread_local bool rbrew_thread_write_observed = false;
+#endif
+
 namespace {
 // 750-style aligned 32-byte reservation granules. Every guest store bumps a
 // version counter for each granule it touches, then writes; lwarx records
@@ -70,7 +77,7 @@ void observe_write(uint8_t* mem, uint32_t address, uint32_t size) noexcept {
 // as in Cemu/decaf. Bumping a shared counter on every guest store cost a
 // locked RMW per store plus cache-line traffic between game threads.
 // RBREW_STRICT_RESERVATIONS=1 restores the 750-style monitor on every store.
-std::atomic<bool> strict_reservations{false}; // constant-initialized
+std::atomic<bool>& strict_reservations = rbrew_strict_reservations_active;
 const bool strict_reservations_from_env = [] {
     const char* v = getenv("RBREW_STRICT_RESERVATIONS");
     if (v && *v && *v != '0') strict_reservations.store(true);
@@ -108,6 +115,7 @@ void rbrew_set_overlay_access(uint8_t* mem, bool enabled) {
 RbrewMemoryWriteObserver rbrew_set_write_observer(RbrewMemoryWriteObserver observer) noexcept {
     const auto previous = write_observer;
     write_observer = observer;
+    rbrew_thread_write_observed = observer.callback != nullptr;
     return previous;
 }
 
@@ -317,7 +325,30 @@ EntryTrace* entry_trace() {
 }
 }
 
+// Every guest virtual call (bctrl) and computed jump (bctr) arrives here.
+// Without an enabled entry trace or import profile -- the shipped game
+// compiles both out -- a known target is called directly instead of first
+// checking both diagnostics' function-local statics and building a profiler
+// scope. Fixed before guest code runs.
+namespace {
+const bool dispatch_instrumented = [] {
+    const char* trace = rbrew_diagnostic_env("RBREW_ENTRY_TRACE");
+    const char* profile = rbrew_diagnostic_env("RBREW_IMPORT_PROFILE");
+    return (trace && *trace) || (profile && *profile && *profile != '0');
+}();
+}
+
 void rbrew_dispatch(CPUState* cpu, uint32_t guest_addr) {
+    if (!dispatch_instrumented && !cpu->differential_validation) {
+        const uint32_t index = guest_addr >> 2;
+        if (index < cpu->dispatch_size) {
+            if (HostFunc fn = cpu->dispatch_table[index]) {
+                RBREW_COVERAGE_EVENT('D', cpu->lr, guest_addr);
+                fn(cpu);
+                return;
+            }
+        }
+    }
     if (cpu->differential_validation)
         throw std::runtime_error("dispatch/HLE is forbidden during detached differential replay");
     if (EntryTrace* trace = entry_trace(); trace && trace->watched.contains(guest_addr)) {

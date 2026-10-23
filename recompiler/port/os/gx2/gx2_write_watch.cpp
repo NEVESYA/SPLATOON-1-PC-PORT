@@ -113,6 +113,23 @@ bool collect_pages(const uint8_t* mem,uint64_t first,uint64_t last) {
     for (uint64_t page = first; page <= last; ++page) s_page_epoch[page] = s_epoch;
     return true;
 }
+// Render batch only: collect the aligned 64 KiB window around an uncollected
+// range in one OS call. Each reset query costs a kernel transition and TLB
+// work, and per-character uniform blocks (palettes, shape blocks) sit in
+// neighbouring pages that the batch asks for one draw at a time. Writes found
+// on the neighbours enter the page history like any other collection, so
+// later queries in this epoch answer from it with unchanged results; the next
+// batch asks the OS again. A window outside the watched allocation falls back
+// to the exact range.
+constexpr uint64_t kWindowPages = 16;
+bool collect_batch_pages(const uint8_t* mem,uint64_t first,uint64_t last) {
+    if(t_epoch_reuse && mem==t_observed_mem) {
+        const uint64_t window_first=first&~(kWindowPages-1);
+        const uint64_t window_last=std::min<uint64_t>(last|(kWindowPages-1),s_page_epoch.size()-1);
+        if((window_first!=first || window_last!=last) && collect_pages(mem,window_first,window_last))return true;
+    }
+    return collect_pages(mem,first,last);
+}
 uint64_t newest(uint64_t first,uint64_t last) {
     uint32_t generation = 0;
     for (uint64_t page = first; page <= last; ++page) generation = std::max(generation, s_page_generation[page]);
@@ -144,7 +161,7 @@ uint64_t gx2_write_generation(const uint8_t* mem,uint32_t addr,uint32_t size) {
     std::lock_guard lock(s_lock);select_arena(mem);++s_checks;
     uint64_t generation;
     if(memoized(mem,addr,size,generation))return generation;
-    generation=(collected_this_epoch(mem,first,last) || collect_pages(mem,first,last))?newest(first,last):kGx2WriteUntracked;
+    generation=(collected_this_epoch(mem,first,last) || collect_batch_pages(mem,first,last))?newest(first,last):kGx2WriteUntracked;
     remember_range(mem,addr,size,generation);return generation;
 }
 void gx2_write_generations(const uint8_t* mem,Gx2WriteRange* ranges,uint32_t count) {
@@ -168,11 +185,13 @@ void gx2_write_generations(const uint8_t* mem,Gx2WriteRange* ranges,uint32_t cou
         const uint64_t first_page=first->address/kPage;
         uint64_t last_page=(uint64_t(first->address)+first->size-1)/kPage;
         size_t end=first_range+1;
-        // Merge only overlapping/adjacent pages: never reset unrequested gaps.
+        // Merge only overlapping/adjacent requested pages. Outside a render
+        // batch, unrequested gaps are never reset; a batch may collect whole
+        // windows (collect_batch_pages).
         while(end<s_ranges.size() && s_ranges[end]->address/kPage<=last_page+1) {
             last_page=std::max(last_page,(uint64_t(s_ranges[end]->address)+s_ranges[end]->size-1)/kPage);++end;
         }
-        const bool tracked=collected_this_epoch(mem,first_page,last_page) || collect_pages(mem,first_page,last_page);
+        const bool tracked=collected_this_epoch(mem,first_page,last_page) || collect_batch_pages(mem,first_page,last_page);
         for(size_t i=first_range;i<end;++i) {
             auto& range=*s_ranges[i];
             range.generation=tracked?newest(range.address/kPage,(uint64_t(range.address)+range.size-1)/kPage):kGx2WriteUntracked;

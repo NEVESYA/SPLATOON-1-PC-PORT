@@ -100,7 +100,18 @@ void gx2_render_vk_test_plaza() {
         require(s_last_exact_key!=before,"in-place vertex bytecode change reused a memoized key");
         mem[vs+8]=vs_saved;gx2_write_watch_begin_batch();again();require(s_last_exact_key==before,"restored vertex bytecode did not return its key");
         S.regs[0xA08F]=7;again();require(s_last_exact_key!=before,"changed key register reused a memoized key");
-        S.regs[0xA08F]=15;again();require(s_last_exact_key==before,"restored key register did not return its key");}
+        S.regs[0xA08F]=15;again();require(s_last_exact_key==before,"restored key register did not return its key");
+        // Pairs 0 and 24 have equal program sizes and key registers. After both
+        // pages are written, a draw of 0 follows one of 24 whose page has the
+        // newer generation: the previous draw's memo must not vouch for it.
+        auto key_of=[&](unsigned pair){select(pair,false,false);again();return std::pair{s_last_exact_key,s_last_program};};
+        s_test_key_memo_enabled=false;const auto first=key_of(0),second=key_of(24);s_test_key_memo_enabled=true;
+        require(first.first!=second.first,"plaza memo contract needs distinct programs");
+        for(unsigned repeat=0;repeat<3;++repeat){
+            for(unsigned pair:{0u,24u}){volatile uint8_t* at=mem+table[pair].ps+table[pair].ps_size-1;*at=*at;}
+            gx2_write_watch_begin_batch();
+            require(key_of(0)==first && key_of(24)==second && key_of(0)==first && key_of(24)==second,
+                    "memoized key of another program range was reused for equal-sized code");}}
     end_rendering();require(gx2vk::finish(),"plaza contract completion failed");
     // Warm every program and pipeline the measured frames use.
     for(unsigned f=0;f<frames;++f){gx2_write_watch_begin_batch();frame(f);end_rendering();gx2vk::submit(false);}

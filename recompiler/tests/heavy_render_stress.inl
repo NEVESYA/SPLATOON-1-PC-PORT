@@ -231,3 +231,4 @@ void gx2_render_vk_test_packet_batches() {
 }
 
 #include "plaza_render_stress.inl"
+#include "npc_render_stress.inl"

@@ -451,3 +451,129 @@ window on each adapter and reads back the swapchain image
 cases also passed with serial recording, and the validated render cases
 (including `overlay_present`) passed synchronization validation. The game was
 not launched.
+
+## Character (NPC) pass (2026-10-23)
+
+No game executable was run. Characters (Plaza NPCs, Octarians, other
+skinned models) reach the runtime in two places: nn::g3d's per-bone math runs
+as recompiled paired-single code, and every shape draw binds per-character
+uniform blocks (matrix palette, shape block) plus shared material and scene
+blocks through `GX2Set*UniformBlock`. Skinning itself runs in the vertex
+shader; no CPU-side vertex transformation was found to remove. The earlier
+benches used uniform registers only, so the block path was unmeasured.
+
+The new `npc_<1|10|25|50|100>` and `npc_fallback_50` cases model that: 64-bone
+palettes and eight 64-byte shape blocks per character, rewritten by the CPU
+every frame. Real four-bone skinning in the vertex shader. Shadow casters are
+drawn character by character, the colour pass material by material, so
+characters interleave. Every shape owns a tile whose colour encodes the exact
+palette, shape, material and scene words the GPU read. All tiles plus shadow
+depth are checked exactly after the final frame. Contracts check a shorter
+block at a cached address (distinct upload, zero padding) and in-place palette
+writes. These are workload proxies, not captured Plaza frames.
+
+Changes (draw order, workload, shaders, caches and visuals are unchanged):
+
+- **Uniform-block residency by guest range.** Tracked blocks are cached by
+  guest address, size and padded size, like index spans, instead of by
+  stage/bank slot. The slot cache re-copied a palette every time draws
+  switched characters or passes, twice (guest → vector → ring). Unchanged
+  ranges now reuse their ring span; changed ones are copied once, straight
+  into the ring. A per-slot memo skips the lookup when the same range is
+  bound again in the same recording. Untracked memory keeps the old
+  compare-bytes path.
+- **Batched write-watch collection.** A render batch collects the aligned
+  64 KiB window around an uncollected range in one `GetWriteWatch` call.
+  Neighbouring palettes and shape blocks were each costing a reset query;
+  results enter the same page history, and outside a batch nothing changes.
+- **Exact-key memo fix (correctness).** `ExactKeyMemo` trusted
+  "generation ≤ proven" without checking that the proven generation
+  belonged to the same guest range. Pages collected by one query share a
+  generation, so a different program of the same size and register inputs
+  could reuse the previous draw's key: the wrong shader. The original code
+  fails the new plaza contract (pairs 0/24 after a write); it now skips the
+  byte comparison only for the proven range.
+- Stream-out state (eight buffer records) is built only for draws that enable
+  stream-out. The guest-range cache hashes use a full 64-bit finalizer;
+  fixed-stride blocks shared low bits, and therefore buckets.
+
+Seven alternating runs of distinct baseline/candidate executables, identical
+workloads, identical output checksums (`build/npc-benchmark-results.json`).
+CPU time per synthetic frame (median), uniform uploads and write-watch OS
+queries per frame:
+
+| Case | RTX 4050 before → after | Intel UHD before → after | Uploads | OS queries |
+| --- | --- | --- | --- | --- |
+| `npc_10` | 0.166 → 0.107 ms | 0.168 → 0.133 ms | 262 → 100 | 19 → 4 |
+| `npc_25` | 0.380 → 0.242 ms | 0.372 → 0.273 ms | 637 → 235 | 32 → 13 |
+| `npc_50` | 0.760 → 0.468 ms | 0.673 → 0.523 ms | 1,262 → 460 | 54 → 9 |
+| `npc_100` | 1.530 → 0.954 ms (P99 8.40 → 1.23) | 1.327 → 1.120 ms (P99 3.85 → 2.27) | 2,512 → 910 | 98 → 10 |
+| `npc_fallback_50` | 0.752 → 0.483 ms | 0.669 → 0.526 ms | 1,262 → 460 | 54 → 9 |
+| `plaza` | 1.215 → 1.129 ms | 1.261 → 1.161 ms | – | – |
+| `heavy` / `heavy_push` | 1.699 → 1.671 / 1.772 → 1.765 ms | 2.796 → 2.762 / 2.394 → 2.476 ms | – | – |
+
+`heavy`/`heavy_push` use no uniform blocks and are within noise. The Intel P95
+of several mid-size NPC cases varied in both directions between runs. GPU time
+is unchanged; the NPC cases are GPU-bound in wall time. The baseline
+executable was built from the original renderer with these bench sources;
+its `plaza` uses the original bench file, since the original code fails the
+new memo contract. These are CPU translation-layer measurements, not game FPS.
+
+All 56 CTest cases pass on both RTX 4050 and Intel UHD; the NPC, plaza,
+contracts, lifetime and heavy render cases also pass with serial recording.
+Engineering references: Cemu keys uniform/buffer data by guest range
+([LatteBufferCache](https://github.com/cemu-project/Cemu/blob/main/src/Cafe/HW/Latte/Core/LatteBufferCache.cpp)).
+Not done: GPU instancing and cross-character batching. GX2 draws carry no
+proof that two characters' draws are reorderable or share state, so the
+original order is kept.
+
+## Guest-code memory helpers for character animation (2026-10-23)
+
+No game executable was run. Character animation (nn::g3d curve sampling,
+quaternion/matrix math, palette writes) and all other guest logic run as
+recompiled C++ that calls a runtime helper for every guest load and store.
+In the shipped objects those helpers were out of line in large functions:
+a sampled part (`Gambit_part0100.obj`) made 1,771 calls to `rbrew_write32`
+and 681 to `rbrew_read32`, each calling `rbrew_memory_accessible` and, for
+stores, `rbrew_write_memory` in turn.
+
+Changes (no forced inlining; compile time per part unchanged, 6.6/10.4/7.5 s
+vs 7.5/13.7/6.6 s for parts 0100/0183/0010, objects within ±5%):
+
+- **Smaller load/store helpers** (`rebrewu_runtime.h`). The helper is the
+  application-arena test plus the access; any other address calls a
+  non-inlined `*_checked` function holding the original logic, including
+  out-of-bounds behaviour. The compiler now inlines them itself: the same part
+  has ~0 hot-path `rbrew_read32` calls and 221 `rbrew_write32` calls.
+- **Plain stores copy directly.** A thread-local flag (kept by
+  `rbrew_set_write_observer`) and the strict-reservation flag select
+  `rbrew_write_memory` exactly when it was needed (observer or strict mode).
+  `/Zc:tlsGuards-` on the `Gambit` target removes the per-access TLS guard;
+  the flag is constant-initialized static TLS.
+- **`cntlzw`** uses `_BitScanReverse` on MSVC instead of a bit loop;
+  byte swaps use the compiler intrinsics.
+- **Dispatch fast path** (`rebrewu_runtime.cpp`): virtual calls go straight to
+  a known target when the entry trace / import profiler are off (always in
+  the shipped game): 3.0 → 2.1 ns per call.
+
+`gambit_guest_bench` (new) runs authored guest skeletal animation in the form
+RebrewU emits: 96 bones, 10 Hermite curves per bone through virtual calls,
+paired-single transform and concatenation, 64-bone byte-reversed palette.
+Three alternating runs against a baseline built from the original runtime,
+identical palette and state checksums, zero allocations:
+
+| Characters | Before (median) | After (median) |
+| --- | --- | --- |
+| 1 | 0.14 ms | 0.12 ms |
+| 10 | 1.48–1.52 ms | 1.23–1.30 ms |
+| 25 | 3.81–4.01 ms | 3.09–3.26 ms |
+| 50 | 7.57–8.56 ms | 6.18–6.32 ms |
+| 100 | 15.46–16.47 ms (P99 17.5–32.1) | 12.40–12.91 ms (P99 14.3–15.4) |
+
+Curve sampling (scalar FP) went from 53 to 37 ns per call. Paired-single math
+is unchanged: `rbrew_ps` stays out of line; faster paths inside it were
+measured and reverted (layout noise exceeded any gain). The NPC render bench
+(`npc_100`) is GPU-bound (3.2 ms GPU vs 1.8 ms CPU per synthetic frame); its
+CPU translation is ~1.1 µs per draw. These are synthetic measurements, not
+game FPS. 60/60 CTest cases pass on RTX 4050; render, advanced and guest
+cases (31) pass on Intel UHD.

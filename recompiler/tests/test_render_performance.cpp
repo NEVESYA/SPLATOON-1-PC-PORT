@@ -111,6 +111,7 @@ void gx2_render_vk_test_watch_ranges();
 void gx2_render_vk_test_vertex_plans();
 void gx2_render_vk_test_packet_batches();
 void gx2_render_vk_test_plaza();
+void gx2_render_vk_test_npc(unsigned characters, bool push);
 void player_anim_register();
 void player_anim_test_advance_idle(double seconds);
 uint32_t player_anim_test_find_skeletal(CPUState* cpu,uint32_t controller,const char* name);
@@ -342,7 +343,12 @@ int main(int argc, char** argv) {
         if(std::string_view(argv[1])=="idle_lookaround"){idle_lookaround_test();return 0;}
         if(std::string_view(argv[1])=="overlay_present")return overlay_present_test();
         const std::string_view mode=argv[1];
-        if(mode!="fallback" && mode!="push" && mode!="churn" && mode!="contracts" && mode!="lifetime" && mode!="heavy" && mode!="heavy_push" && mode!="overdraw" && mode!="watch" && mode!="geometry" && mode!="packets" && mode!="plaza" && mode!="overlay")throw std::runtime_error("unknown authored benchmark");
+        // npc_<count> / npc_fallback_<count>: skinned characters, 1-100.
+        unsigned npc_characters=0;const bool npc_fallback=mode.starts_with("npc_fallback_");
+        if(mode.starts_with("npc_")){const auto digits=mode.substr(npc_fallback?13:4);
+            if(digits=="1" || digits=="10" || digits=="25" || digits=="50" || digits=="100")npc_characters=unsigned(std::stoul(std::string(digits)));
+            else throw std::runtime_error("unknown authored benchmark");}
+        if(!npc_characters && mode!="fallback" && mode!="push" && mode!="churn" && mode!="contracts" && mode!="lifetime" && mode!="heavy" && mode!="heavy_push" && mode!="overdraw" && mode!="watch" && mode!="geometry" && mode!="packets" && mode!="plaza" && mode!="overlay")throw std::runtime_error("unknown authored benchmark");
         if(!gx2vk::init(nullptr))return 77;
         gx2_render_init();
         std::printf("{\"device\":\"%s\",\"workload\":\"%s\",\"synthetic\":true}\n",gx2vk::caps().device_name.c_str(),argv[1]);
@@ -354,6 +360,7 @@ int main(int argc, char** argv) {
         else if(mode=="geometry")gx2_render_vk_test_vertex_plans();
         else if(mode=="packets")gx2_render_vk_test_packet_batches();
         else if(mode=="plaza")gx2_render_vk_test_plaza();
+        else if(npc_characters)gx2_render_vk_test_npc(npc_characters,!npc_fallback);
         else if(mode=="lifetime")gx2_render_vk_test_lifetime();
         else if(mode=="heavy" || mode=="heavy_push" || mode=="overdraw")gx2_render_vk_test_heavy(mode=="overdraw",mode=="heavy_push");
         else gx2_render_vk_test_stress(mode=="push",mode=="churn");
