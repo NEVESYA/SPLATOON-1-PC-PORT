@@ -2,6 +2,7 @@
 #include "runtime/host_sleep.h"
 #include "runtime/rebrewu_runtime.h"
 #include "os/gx2/gx2_native_context.h"
+#include "os/gx2/gx2_addrs.h"
 #include "os/gx2/gx2_render.h"
 #include "os/gx2/gx2_surface.h"
 #include "os/gx2/gx2_detile.h"
@@ -16,6 +17,10 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+void gx2_draw_register(CPUState*);
+void gx2_display_list_register(CPUState*);
+uint64_t gx2_query_fast_read_count_for_test();
 
 namespace {
 void require(bool value, const char* message) {
@@ -192,6 +197,89 @@ void queue() {
     require(observed == 1524, "render queue lost a task");
     std::puts("render queue: sleep/wake, asynchronous FIFO and concurrent producers passed");
 }
+void queries() {
+    Renderer renderer;
+    std::vector<uint8_t> mem(65536);
+    std::vector<HostFunc> table((ADDR_GX2QueryGetOcclusionResult >> 2) + 1);
+    CPUState cpu{};
+    cpu.mem = mem.data(); cpu.guest_memory_size = uint32_t(mem.size());
+    cpu.dispatch_table = table.data(); cpu.dispatch_size = uint32_t(table.size());
+    gx2_draw_register(&cpu); gx2_display_list_register(&cpu);
+    auto call = [&](uint32_t fn, uint32_t a, uint32_t b = 0) {
+        cpu.r[3] = a; cpu.r[4] = b; cpu.r[5] = 0;
+        require(table[fn >> 2] != nullptr, "query import missing");
+        table[fn >> 2](&cpu);
+        return cpu.r[3];
+    };
+    constexpr uint32_t query = 0x100, sibling = 0x200, output = 0x300, list = 0x1000;
+    call(ADDR_GX2BeginDisplayListEx, list, 4096);
+    for (auto address : {query, sibling}) {
+        call(ADDR_GX2QueryBegin, 0, address);
+        call(ADDR_GX2QueryEnd, 0, address);
+    }
+    const uint32_t bytes = call(ADDR_GX2EndDisplayList, list);
+    gx2_native_start_render_thread();
+    gx2_dl_call(&cpu, list, bytes);
+    gx2_native_run(true, [] {});
+    auto idle = [] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!gx2_native_queue_idle() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        require(gx2_native_queue_idle(), "render queue did not become idle");
+    };
+    idle();
+    require(call(ADDR_GX2QueryGetOcclusionResult, query, output) == 1, "completed query was not published");
+    idle();
+    const auto before = gx2_query_fast_read_count_for_test();
+    require(call(ADDR_GX2QueryGetOcclusionResult, sibling, output) == 1, "sibling query was not published");
+    const auto fast_start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < 1000; ++i)
+        require(call(ADDR_GX2QueryGetOcclusionResult, query, output) == 1 && rbrew_read64(mem.data(), output) == 0,
+                "cached query changed its result");
+    require(gx2_query_fast_read_count_for_test() - before == 1001, "listed queries still round-trip through the render queue");
+    const double fast_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fast_start).count();
+    const auto queued_start = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < 1000; ++i)
+        gx2_native_run(true, [&] { require(gx2_render_query_result(query, output, mem.data()), "queued query failed"); });
+    const double queued_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - queued_start).count();
+    rbrew_write64(mem.data(), query + 8, rbrew_bswap64((1ull << 63) | 7));
+    require(call(ADDR_GX2QueryGetOcclusionResult, query, output) == 1 && rbrew_read64(mem.data(), output) == 7,
+            "CPU counter updates were hidden by a cache");
+    rbrew_write64(mem.data(), query, 0);
+    require(call(ADDR_GX2QueryGetOcclusionResult, query, output) == 0 && rbrew_read64(mem.data(), output) == 0,
+            "CPU-cleared counters reported a stale result");
+    rbrew_write64(mem.data(), query, rbrew_bswap64(1ull << 63));
+    std::array<uint8_t, 64> previous{};
+    std::memcpy(previous.data(), mem.data() + query, previous.size());
+    call(ADDR_GX2BeginDisplayListEx, list + 4096, 4096);
+    call(ADDR_GX2QueryBegin, 0, query);
+    const uint32_t begin_bytes = call(ADDR_GX2EndDisplayList, list + 4096);
+    require(call(ADDR_GX2QueryGetOcclusionResult, query, output) == 0, "recording a CPU query did not clear its counters immediately");
+    std::memcpy(mem.data() + query, previous.data(), previous.size());
+    struct Gate final : Gx2AsyncWork {
+        std::promise<void>& entered; std::shared_future<void> release;
+        Gate(std::promise<void>& entered, std::shared_future<void> release) : entered(entered), release(release) {}
+        void run() override { entered.set_value(); release.wait(); }
+    };
+    std::promise<void> entered, release;
+    gx2_native_post(new Gate(entered, release.get_future().share()));
+    entered.get_future().wait();
+    const bool busy = !gx2_native_queue_idle();
+    gx2_dl_call(&cpu, list + 4096, begin_bytes);
+    auto pending = std::async(std::launch::async, [&] { return call(ADDR_GX2QueryGetOcclusionResult, query, output); });
+    // A begin still queued behind render work waits for the render queue:
+    // Splatoon uses the result in the same frame (RBREW_QUERY_ASYNC=1 opts
+    // into an immediate "not ready" instead).
+    const bool waited = pending.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
+    release.set_value();
+    const auto result = pending.get();
+    require(busy && waited && result == 0, "queued query begin reused a stale completed result");
+    gx2_native_run(true, [&] { gx2_render_query_end(0, query, mem.data()); });
+    require(call(ADDR_GX2QueryGetOcclusionResult, query, output) == 1 && rbrew_read64(mem.data(), output) == 0,
+            "query reuse failed after pending work");
+    gx2_native_stop_render_thread();
+    std::puts("queries: 1001 caller-side reads; sibling publication, CPU writes and queued begin ordering preserved");
+    std::printf("synthetic 1000 completed-query reads: queued %.3f ms, caller-side %.3f ms (not game FPS)\n", queued_ms, fast_ms);
+}
 void compiler() {
     gx2vk::CompileQueue queue(1);
     std::promise<void> started, released;
@@ -238,10 +326,10 @@ int main(int argc, char** argv) {
         else if (mode == "queue") queue();
         else if (mode == "detile") detile();
         else if (mode == "compiler") compiler();
-        else if (mode == "uploads" || mode == "textures") {
+        else if (mode == "uploads" || mode == "textures" || mode == "queries") {
             if (!gx2vk::init(nullptr)) { std::puts("No compatible Vulkan device available"); return 77; }
             std::printf("Vulkan device: %s\n", gx2vk::caps().device_name.c_str());
-            if (mode == "uploads") uploads(); else textures();
+            if (mode == "uploads") uploads(); else if (mode == "queries") queries(); else textures();
         } else throw std::runtime_error("unknown test mode");
         return 0;
     } catch (const std::exception& error) {

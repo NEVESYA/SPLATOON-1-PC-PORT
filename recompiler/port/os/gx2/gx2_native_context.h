@@ -54,10 +54,12 @@ struct Gx2AsyncWork {
 };
 #if defined(HAVE_SDL2)
 bool gx2_native_async_active();               // this thread may post
+bool gx2_native_queue_idle();
 void gx2_native_post(Gx2AsyncWork* work);     // takes ownership
 #else
 // Builds without a window (front-end unit tests) run everything on the caller.
 inline bool gx2_native_async_active() { return false; }
+inline bool gx2_native_queue_idle() { return true; }
 inline void gx2_native_post(Gx2AsyncWork* work) { work->run(); delete work; }
 #endif
 

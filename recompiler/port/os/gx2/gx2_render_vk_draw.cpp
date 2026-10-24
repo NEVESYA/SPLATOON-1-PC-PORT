@@ -33,6 +33,7 @@
 #endif
 #include <memory>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <map>
@@ -577,7 +578,7 @@ template<class F> auto post_compile(F&& fn, bool background = false) {
     if (async_shader_compile()) {
         if (!s_compile_queue) {
             const unsigned cores = std::thread::hardware_concurrency();
-            s_compile_queue = std::make_unique<gx2vk::CompileQueue>(std::clamp(cores > 2 ? cores - 2 : 1u, 1u, 4u));
+            s_compile_queue = std::make_unique<gx2vk::CompileQueue>(std::clamp(cores > 2 ? cores - 2 : 1u, 1u, std::max(4u, cores > 2 ? cores - 2 : 1u)));
         }
         return s_compile_queue->post(std::move(task_fn), background);
     }
@@ -2468,43 +2469,71 @@ void warm_start() {
     // each body is parsed and linked once per (rect, points).
     struct BodyLink { std::shared_ptr<const std::vector<uint8_t>> body; uint32_t rect, points; Program* prog; };
     std::unordered_map<const void*, std::vector<BodyLink>> body_links;
-    for (const auto& p : programs) {
-        ++visited;
-        if (s_warm_progress && warm_seconds() - last_progress >= 0.05) {
-            last_progress = warm_seconds();
-            s_warm_progress(0.5 + 0.5 * double(visited) / double(programs.size()));
-        }
-        if (s_prog_cache.count(p.key)) continue;
-        bool absent = false;
-        auto body = preloaded_translation(dir, p.key, absent);
-        Program* prog = nullptr;
-        if (body) if (auto links = body_links.find(body.get()); links != body_links.end())
-            for (const auto& link : links->second) if (link.rect == p.rect && link.points == p.points) prog = link.prog;
-        if (prog) {
-            ++loaded; ++linked;
-            release_preloaded_translation(dir, p.key);
-            if (!prog->warm_key) prog->warm_key = p.key;
-            s_prog_cache[p.key] = prog;
-            continue;
-        }
-        std::array<R700TranslationInfo, 2> info;
-        char* vs = nullptr; char* ps = nullptr;
-        const double load_start = warm_seconds();
-        const bool found = load_translation(p.key, vs, ps, info);
-        load_seconds += warm_seconds() - load_start;
-        if (!found) continue;
-        ++loaded;
-        bool reused = false;
-        const double link_start = warm_seconds();
-        prog = link_program(vs, ps, info, p.rect, p.points, false, reused, true);
-        link_seconds += warm_seconds() - link_start;
-        std::free(vs); std::free(ps);
-        if (!prog) continue;
-        ++linked;
-        if (body) body_links[body.get()].push_back({body, p.rect, p.points, prog});
-        if (!prog->warm_key) prog->warm_key = p.key;
-        s_prog_cache[p.key] = prog;
+    std::mutex warm_mutex;
+    std::atomic<size_t> next_prog_idx{0};
+    std::atomic<size_t> atomic_loaded{0}, atomic_linked{0}, atomic_visited{0};
+    const unsigned workers = std::clamp(std::thread::hardware_concurrency(), 2u, 14u);
+    std::vector<std::thread> warm_pool;
+    for (unsigned w = 0; w < workers; ++w) {
+        warm_pool.emplace_back([&] {
+            for (size_t idx; (idx = next_prog_idx.fetch_add(1, std::memory_order_relaxed)) < programs.size(); ) {
+                const auto& p = programs[idx];
+                atomic_visited.fetch_add(1, std::memory_order_relaxed);
+                {
+                    std::lock_guard lock(warm_mutex);
+                    if (s_prog_cache.count(p.key)) continue;
+                }
+                bool absent = false;
+                auto body = preloaded_translation(dir, p.key, absent);
+                Program* prog = nullptr;
+                if (body) {
+                    std::lock_guard lock(warm_mutex);
+                    if (auto links = body_links.find(body.get()); links != body_links.end()) {
+                        for (const auto& link : links->second) {
+                            if (link.rect == p.rect && link.points == p.points) { prog = link.prog; break; }
+                        }
+                    }
+                }
+                if (prog) {
+                    atomic_loaded.fetch_add(1, std::memory_order_relaxed);
+                    atomic_linked.fetch_add(1, std::memory_order_relaxed);
+                    release_preloaded_translation(dir, p.key);
+                    std::lock_guard lock(warm_mutex);
+                    if (!prog->warm_key) prog->warm_key = p.key;
+                    s_prog_cache[p.key] = prog;
+                    continue;
+                }
+                std::array<R700TranslationInfo, 2> info;
+                char* vs = nullptr; char* ps = nullptr;
+                const bool found = load_translation(p.key, vs, ps, info);
+                if (!found) continue;
+                atomic_loaded.fetch_add(1, std::memory_order_relaxed);
+                bool reused = false;
+                {
+                    std::lock_guard lock(warm_mutex);
+                    prog = link_program(vs, ps, info, p.rect, p.points, false, reused, true);
+                    if (prog) {
+                        atomic_linked.fetch_add(1, std::memory_order_relaxed);
+                        if (body) body_links[body.get()].push_back({body, p.rect, p.points, prog});
+                        if (!prog->warm_key) prog->warm_key = p.key;
+                        s_prog_cache[p.key] = prog;
+                    }
+                }
+                std::free(vs); std::free(ps);
+            }
+        });
     }
+    if (s_warm_progress) {
+        while (atomic_visited.load(std::memory_order_relaxed) < programs.size()) {
+            const size_t v = atomic_visited.load(std::memory_order_relaxed);
+            s_warm_progress(0.5 + 0.5 * double(v) / double(programs.size()));
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+    for (auto& t : warm_pool) t.join();
+    loaded = atomic_loaded.load();
+    linked = atomic_linked.load();
+    visited = atomic_visited.load();
     body_links.clear();   // releases the last references to linked bodies
     RBREW_LOGF(stderr, "[warm] %zu programs listed, %zu loaded (%.2f s), %zu linked (%.2f s), loop %.2f s\n",
                programs.size(), loaded, load_seconds, linked, link_seconds, warm_seconds());
@@ -2610,6 +2639,12 @@ struct UniformKeyHash {
 struct CachedUniform { gx2vk::Span span; uint64_t written = 0; };
 std::unordered_map<UniformKey, CachedUniform, UniformKeyHash> s_uniform_spans;
 uint64_t s_uniform_chunk = 0;
+// RBREW_UNIFORM_CACHE=0: ignore write-watch generations for uniform blocks and
+// compare guest bytes on every bind (the pre-cache behaviour).
+bool uniform_cache_enabled() {
+    static const bool on = [] { const char* v = std::getenv("RBREW_UNIFORM_CACHE"); return !(v && v[0] == '0'); }();
+    return on;
+}
 // Last answer per stage/bank. A span found or uploaded during the recording
 // in progress stays reserved until that recording completes, so the same
 // range bound again in it needs neither the map lookup nor a chunk check.
@@ -2722,9 +2757,15 @@ struct VertexBindings {
     VkDeviceSize offsets[kMaxVertexInputs]{};
 };
 
+void flush_streamouts(uint8_t* mem);
+void flush_streamouts_for_draw(uint8_t* mem);
+
 // gx2_setup_vertex_attribs: fetch attributes -> one binding per location.
 void setup_vertex_attribs(uint8_t* mem, Program& prog, VertexBindings& out) {
     Gx2PerfScope perf_scope(kPerfVertex);
+    // Publish pending stream-out results only if this draw can read them
+    // (see flush_streamouts_for_draw); RBREW_STREAMOUT_EAGER=1 always flushes.
+    flush_streamouts_for_draw(mem);
     out.input.count = 0;
     const auto& mapping = prog.info[0].attribute_locations;
     // Locations the vertex shader reads: every semantic with a location, up
@@ -2957,7 +2998,7 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
             const uint64_t written = block_generations[bank];
             const VkDeviceSize declared = VkDeviceSize(vk.uniform_buffer_vec4s[bank]) * 16;
             const VkDeviceSize bytes = std::max<VkDeviceSize>(std::max<VkDeviceSize>(block.size, declared), 16);
-            if (written != kGx2WriteUntracked) {
+            if (written != kGx2WriteUntracked && uniform_cache_enabled()) {
                 // Tracked memory: residency follows the guest range, like
                 // index spans, not the bank slot. Characters bind their own
                 // palette/shape blocks to the same banks; a slot cache
@@ -3006,7 +3047,7 @@ bool build_stage(uint8_t* mem, Program& prog, unsigned stage, StageDescriptors& 
             // Untracked memory: compare against the slot's last uploaded bytes.
             const uint64_t written = block_generations[bank];
             const bool same_binding = block.uploaded && block.uploaded_mem == mem && block.uploaded_address == block.address && block.uploaded_size == block.size;
-            const bool verify = !same_binding || written == kGx2WriteUntracked || block.written == kGx2WriteUntracked || written > block.written;
+            const bool verify = !uniform_cache_enabled() || !same_binding || written == kGx2WriteUntracked || block.written == kGx2WriteUntracked || written > block.written;
 #ifndef RBREW_DISABLE_LOGGING
             if (!verify && cache_verify_enabled() && block.uploaded_bytes.size() == block.size)
                 cache_verify("uniform", mem, block.address, block.size, block.uploaded_bytes.data(), mem + block.address, block.written, written);
@@ -3316,6 +3357,9 @@ void frame_trace_draw(Program& prog) {
     RBREW_LOGF(stderr, "[ftrace] draw#%u fbo=%u prog=%u vs=%08X ps=%08X vp=%d,%d,%dx%d blend=%d cw=%d depth=%d\n", s_frame_draw_index - 1, S.current_fbo_id, prog.id,
                  S.cur_vs, S.cur_ps,
                  g.viewport[0], g.viewport[1], g.viewport[2], g.viewport[3], int(g.blend), int(S.color_write), int(g.depth_test));
+    RBREW_LOGF(stderr, "[ftrace]   blend rgb=%X/%X eq=%X alpha=%X/%X eq=%X mask0=%X regs A1E0=%08X A202=%08X\n",
+                 g.blend_src_rgb, g.blend_dst_rgb, g.blend_eq_rgb, g.blend_src_alpha, g.blend_dst_alpha, g.blend_eq_alpha,
+                 unsigned(g.color_mask[0]), S.regs[0xA1E0], S.regs[0xA202]);
     // Raw sampler words of every unit the pixel stage reads: word0 carries the
     // filters and the depth-compare function, word1 the LOD clamps and word2
     // FORCE_DEGAMMA/high-precision flags. These identify a material's sampling
@@ -3375,17 +3419,38 @@ struct IndexStream { bool indexed = false; gx2vk::Span span; VkIndexType type = 
 // The current CPU publication boundary completes each export before the
 // next draw, so its scratch storage can be reused safely. Do not allocate,
 // initialize and destroy four native buffers on every particle update.
-gx2vk::Buffer s_streamout_data[4],s_streamout_counter[4];
+struct StreamOutBatch {
+    static constexpr size_t kMaxBatch = 32;
+    struct Entry {
+        gx2vk::Buffer data[4], counter[4];
+        uint32_t addresses[4]{}, sizes[4]{}, offsets[4]{}, expected[4]{}, mask = 0, count = 0;
+        const R700TranslationInfo* info = nullptr;
+    };
+    Entry entries[kMaxBatch];
+    size_t pending_count = 0;
+    gx2vk::Buffer pool_data[kMaxBatch][4];
+    gx2vk::Buffer pool_counter[kMaxBatch][4];
+};
+static StreamOutBatch s_streamout_batch;
+static uint8_t* s_last_mem = nullptr;
+
+void flush_streamouts(uint8_t* mem);
+
 VkPhysicalDeviceTransformFeedbackPropertiesEXT s_streamout_limits{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT};
 bool s_streamout_limits_valid=false;
+
 struct GuestStreamOut {
     gx2vk::Buffer data[4], counter[4];
     VkBuffer counters[4]{};
     VkDeviceSize counter_offsets[4]{};
-    uint32_t addresses[4]{}, sizes[4]{}, offsets[4]{}, mask=0,count=0;
+    uint32_t addresses[4]{}, sizes[4]{}, offsets[4]{}, mask=0, count=0;
     const R700TranslationInfo* info=nullptr;
     uint32_t fragments=~0u;
+    uint64_t assembled_vertices = 0;
+    uint32_t draw_instances = 1;
+
     bool prepare(uint8_t* mem,const Program& program,bool position_capture,VkPrimitiveTopology topology,uint32_t vertices,uint32_t instances) {
+        s_last_mem = mem;
         if(!(S.regs[0xA2AC]&1))return true;
         mask=program.info[0].streamout_mask;
         if(!mask)return true;
@@ -3397,16 +3462,22 @@ struct GuestStreamOut {
         if((S.regs[0xA2C8]&mask)!=mask) {
             RBREW_LOGF(stderr,"[gx2] stream-out shader uses a disabled output buffer\n");return false;
         }
+        if (s_streamout_batch.pending_count >= StreamOutBatch::kMaxBatch) {
+            flush_streamouts(mem);
+        }
         uint64_t assembled=vertices;
         if(topology==VK_PRIMITIVE_TOPOLOGY_LINE_STRIP)assembled=vertices>1?uint64_t(vertices-1)*2:0;
         if(topology==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || topology==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN)
             assembled=vertices>2?uint64_t(vertices-2)*3:0;
+        assembled_vertices = assembled;
+        draw_instances = instances;
         if(!s_streamout_limits_valid) {
             VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};props.pNext=&s_streamout_limits;
             vkGetPhysicalDeviceProperties2(gx2vk::physical_device(),&props);
             s_streamout_limits_valid=true;
         }
         const auto& tf=s_streamout_limits;
+        const size_t batch_idx = s_streamout_batch.pending_count;
         for(unsigned i=0;i<4;++i) {
             if(!(mask&(1u<<i)))continue;
             count=i+1;
@@ -3423,20 +3494,17 @@ struct GuestStreamOut {
             if(!stride || stride>tf.maxTransformFeedbackBufferDataStride || capacity>tf.maxTransformFeedbackBufferSize || capacity>UINT32_MAX) {
                 RBREW_LOGF(stderr,"[gx2] stream-out exceeds native device limits\n");return false;
             }
-            // Hardware clips writes to each guest buffer independently but
-            // advances the byte offset for the full export. Native scratch
-            // storage accommodates the full GPU export before bounded publication.
-            if(s_streamout_data[i].size<capacity) {
-                gx2vk::destroy_buffer(s_streamout_data[i]);
-                s_streamout_data[i]=gx2vk::create_buffer(capacity,VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT,gx2vk::MemoryUse::Readback);
+            auto& b_data = s_streamout_batch.pool_data[batch_idx][i];
+            auto& b_ctr = s_streamout_batch.pool_counter[batch_idx][i];
+            if(b_data.size<capacity) {
+                gx2vk::destroy_buffer(b_data);
+                b_data=gx2vk::create_buffer(capacity,VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT,gx2vk::MemoryUse::Readback);
             }
-            if(!s_streamout_counter[i].buffer)
-                s_streamout_counter[i]=gx2vk::create_buffer(4,VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT,gx2vk::MemoryUse::Readback);
-            data[i]=s_streamout_data[i];counter[i]=s_streamout_counter[i];
+            if(!b_ctr.buffer) {
+                b_ctr=gx2vk::create_buffer(4,VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT,gx2vk::MemoryUse::Readback);
+            }
+            data[i]=b_data; counter[i]=b_ctr;
             if(!data[i].memory.mapped || !counter[i].memory.mapped)return false;
-            // Only the shader's written words are published below. Copying
-            // the entire guest allocation here wastes bandwidth and cannot
-            // contribute to those GPU-written words or preserved holes.
             std::memcpy(counter[i].memory.mapped,&offsets[i],4);
             if(!gx2vk::flush_mapped(counter[i].memory,0,4))return false;
             counters[i]=counter[i].buffer;
@@ -3448,8 +3516,6 @@ struct GuestStreamOut {
         VkBuffer buffers[4]{};VkDeviceSize begin_offsets[4]{},ranges[4]{};
         unsigned first=0;while(!(mask&(1u<<first)))++first;
         for(unsigned i=0;i<count;++i) {
-            // Unused shader slots still need a valid native binding in the
-            // contiguous range. They alias storage the shader never writes.
             const unsigned binding=(mask&(1u<<i))?i:first;
             buffers[i]=data[binding].buffer;ranges[i]=data[binding].size;
         }
@@ -3467,43 +3533,132 @@ struct GuestStreamOut {
         barrier.dstStageMask=VK_PIPELINE_STAGE_2_HOST_BIT;barrier.dstAccessMask=VK_ACCESS_2_HOST_READ_BIT;
         VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};dep.memoryBarrierCount=1;dep.pMemoryBarriers=&barrier;
         vkCmdPipelineBarrier2(cb,&dep);
-        {
-            Gx2PerfScope wait_scope(kPerfSubmitWait);
-            if(!gx2vk::finish())return false;
+
+        for(unsigned i=0;i<count;++i) if(mask&(1u<<i)) {
+            const uint32_t stride=info->streamout_strides[i];
+            const uint32_t expected=offsets[i] + uint32_t(assembled_vertices * draw_instances * stride);
+            S.regs[0xA2B7+i*4] = std::min(expected, sizes[i]);
         }
-        if(trace) {
-            uint64_t passed=0;
-            vkGetQueryPoolResults(gx2vk::device(),query_pool(s_trace_query),s_trace_query%kQueriesPerPool,1,8,&passed,8,VK_QUERY_RESULT_64_BIT);
-            fragments=uint32_t(passed);
+
+        auto& entry = s_streamout_batch.entries[s_streamout_batch.pending_count++];
+        for(unsigned i=0;i<4;++i) entry.expected[i] = S.regs[0xA2B7+i*4];
+        entry.mask = mask;
+        entry.count = count;
+        entry.info = info;
+        for(unsigned i=0;i<count;++i) {
+            entry.data[i] = data[i];
+            entry.counter[i] = counter[i];
+            entry.addresses[i] = addresses[i];
+            entry.sizes[i] = sizes[i];
+            entry.offsets[i] = offsets[i];
         }
-        for(unsigned i=0;i<count;++i)if(mask&(1u<<i)) {
-            if(!gx2vk::invalidate_mapped(counter[i].memory) || !gx2vk::invalidate_mapped(data[i].memory))return false;
-            uint32_t written;std::memcpy(&written,counter[i].memory.mapped,4);
-            if(written<offsets[i] || written>data[i].size) {
-                RBREW_LOGF(stderr,"[gx2] stream-out counter outside buffer %u: %u\n",i,written);return false;
+
+        if(trace || s_streamout_batch.pending_count >= StreamOutBatch::kMaxBatch) {
+            flush_streamouts(mem);
+            if(trace) {
+                uint64_t passed=0;
+                vkGetQueryPoolResults(gx2vk::device(),query_pool(s_trace_query),s_trace_query%kQueriesPerPool,1,8,&passed,8,VK_QUERY_RESULT_64_BIT);
+                fragments=uint32_t(passed);
             }
-            const uint32_t end=std::min(written,sizes[i]),stride=info->streamout_strides[i];
-            static const bool xfb_log=rbrew_diagnostic_env("RBREW_XFB_LOG")!=nullptr;
-            if(xfb_log)
-                RBREW_LOGF(stderr,"[xfb] publish slot=%u base=%08X start=%u end=%u written=%u\n",i,addresses[i],offsets[i],end,written);
-            const auto& words=info->streamout_written_words[i];
-            for(uint32_t byte=offsets[i];byte<end;) {
-                const uint32_t word=((byte-offsets[i])%stride)/4;
-                if(word>=words.size() || !words[word]){byte+=4;continue;}
-                const uint32_t start=byte;byte+=4;
-                while(byte<end) {
-                    const uint32_t next=((byte-offsets[i])%stride)/4;
-                    if(next>=words.size() || !words[next])break;
-                    byte+=4;
-                }
-                rbrew_write_memory(mem,addresses[i]+start,data[i].memory.mapped+start,byte-start);
-            }
-            if(end>offsets[i])gx2_render_invalidate_textures(addresses[i]+offsets[i],end-offsets[i]);
-            S.regs[0xA2B7+i*4]=written;
         }
         return true;
     }
 };
+
+void flush_streamouts(uint8_t* mem) {
+    if(!s_streamout_batch.pending_count) return;
+    if(!mem) mem = s_last_mem;
+    if(!mem) return;
+    {
+        Gx2PerfScope wait_scope(kPerfSubmitWait);
+        if(!gx2vk::finish()) return;
+    }
+    for(size_t b = 0; b < s_streamout_batch.pending_count; ++b) {
+        auto& entry = s_streamout_batch.entries[b];
+        for(unsigned i=0;i<entry.count;++i) if(entry.mask & (1u << i)) {
+            if(!gx2vk::invalidate_mapped(entry.counter[i].memory) || !gx2vk::invalidate_mapped(entry.data[i].memory)) continue;
+            uint32_t written = 0;
+            std::memcpy(&written, entry.counter[i].memory.mapped, 4);
+            if(written < entry.offsets[i] || written > entry.data[i].size) {
+                RBREW_LOGF(stderr, "[gx2] stream-out counter outside buffer %u: %u\n", i, written);
+                continue;
+            }
+            const uint32_t end = std::min(written, entry.sizes[i]);
+            const uint32_t stride = entry.info->streamout_strides[i];
+            static const bool xfb_log = rbrew_diagnostic_env("RBREW_XFB_LOG") != nullptr;
+            if(xfb_log)
+                RBREW_LOGF(stderr, "[xfb] publish slot=%u base=%08X start=%u end=%u written=%u\n", i, entry.addresses[i], entry.offsets[i], end, written);
+            const auto& words = entry.info->streamout_written_words[i];
+            for(uint32_t byte = entry.offsets[i]; byte < end;) {
+                const uint32_t word = ((byte - entry.offsets[i]) % stride) / 4;
+                if(word >= words.size() || !words[word]) { byte += 4; continue; }
+                const uint32_t start = byte; byte += 4;
+                while(byte < end) {
+                    const uint32_t next = ((byte - entry.offsets[i]) % stride) / 4;
+                    if(next >= words.size() || !words[next]) break;
+                    byte += 4;
+                }
+                rbrew_write_memory(mem, entry.addresses[i] + start, entry.data[i].memory.mapped + start, byte - start);
+            }
+            if(end > entry.offsets[i]) {
+                gx2_render_invalidate_textures(entry.addresses[i] + entry.offsets[i], end - entry.offsets[i]);
+            }
+            // Correct the predicted offset only while it is still the value
+            // finish() stored: a later export to this slot or a new
+            // GX2SetStreamOutContext owns the register now.
+            if(S.regs[0xA2B7 + i * 4] == entry.expected[i]) S.regs[0xA2B7 + i * 4] = written;
+        }
+    }
+    s_streamout_batch.pending_count = 0;
+}
+
+// Lazy stream-out publication. Copying exports back to guest memory needs a
+// full GPU wait (gx2vk::finish). Doing that before every following draw
+// stalled the render thread once per export (13% of render-thread time in a
+// 2026-10-24 tutorial profile). Results are now published when a draw reads
+// an overlapping vertex, index, uniform or texture range, at GX2Flush /
+// GX2DrawDone, or when the batch is full. RBREW_STREAMOUT_EAGER=1 restores
+// the old per-draw flush.
+bool streamouts_lazy() {
+    static const bool lazy = [] {
+        const char* value = std::getenv("RBREW_STREAMOUT_EAGER");
+        return !(value && *value && *value != '0');
+    }();
+    return lazy;
+}
+bool streamout_pending_overlaps(uint32_t address, uint64_t size) {
+    if (!s_streamout_batch.pending_count || !address || !size) return false;
+    const uint64_t begin = address, end = uint64_t(address) + size;
+    for (size_t b = 0; b < s_streamout_batch.pending_count; ++b) {
+        const auto& entry = s_streamout_batch.entries[b];
+        for (unsigned i = 0; i < entry.count; ++i) if (entry.mask & (1u << i)) {
+            const uint64_t out_begin = entry.addresses[i], out_end = uint64_t(entry.addresses[i]) + entry.sizes[i];
+            if (begin < out_end && out_begin < end) return true;
+        }
+    }
+    return false;
+}
+void flush_streamouts_if_overlaps(uint8_t* mem, uint32_t address, uint64_t size) {
+    if (!s_streamout_batch.pending_count) return;
+    if (!streamouts_lazy() || streamout_pending_overlaps(address, size)) flush_streamouts(mem);
+}
+void flush_streamouts_for_draw(uint8_t* mem) {
+    if (!s_streamout_batch.pending_count) return;
+    bool needed = !streamouts_lazy();
+    for (unsigned slot = 0; !needed && slot < 32; ++slot)
+        needed = streamout_pending_overlaps(S.attrib[slot].guest_addr, S.attrib[slot].size);
+    for (unsigned stage = 0; !needed && stage < 2; ++stage)
+        for (unsigned bank = 0; !needed && bank < 16; ++bank)
+            needed = streamout_pending_overlaps(S.uniform_blocks[stage][bank].address, S.uniform_blocks[stage][bank].size);
+    for (size_t unit = 0; !needed && unit < S.bound_textures.size(); ++unit) {
+        const auto& bound = S.bound_textures[unit];
+        if (!bound.address) continue;
+        const uint8_t* d = bound.descriptor.data();
+        needed = streamout_pending_overlaps(descriptor_word(d, GX2SURF_IMAGE), descriptor_word(d, GX2SURF_IMAGE_SIZE)) ||
+                 streamout_pending_overlaps(descriptor_word(d, GX2SURF_MIPMAPS), descriptor_word(d, GX2SURF_MIPMAP_SIZE));
+    }
+    if (needed) flush_streamouts(mem);
+}
 
 static bool trace_skip(const char* reason) {
     TXDIAG(txdiag::count(txdiag::Skipped);
@@ -3789,6 +3944,7 @@ void gx2_render_draw_indexed(uint32_t prim_type, uint32_t count, uint32_t index_
     if (idx_bytes64 > UINT32_MAX) return;
     const uint32_t idx_bytes = uint32_t(idx_bytes64);
     if (idx_guest_addr == 0 || !count || !rbrew_memory_accessible(mem, idx_guest_addr, idx_bytes)) return;
+    flush_streamouts_if_overlaps(mem, idx_guest_addr, idx_bytes);   // indices produced by a pending export
     static unsigned draw_trace = 0;
     static const bool s_draw_trace = rbrew_diagnostic_env("RBREW_DRAW_TRACE") != nullptr;
     if (s_draw_trace && draw_trace++ < 32)
@@ -3998,11 +4154,20 @@ void gx2_render_query_end(uint32_t type, uint32_t address, uint8_t* mem) {
     if (!q || !q->open || q->type != type) { RBREW_LOGF(stderr, "[gx2] Query end without matching begin %08X type=%u\n", address, type); return; }
     close_query_segment(); s_open_queries.erase(q); q->open = false; q->ended = true;
     open_query_segment();
+    uint64_t serial = 0;
+    if (s_open_queries.empty()) {
+        serial = gx2vk::submit(false);
+    } else {
+        serial = gx2vk::recording_serial();
+    }
+    gx2_query_render_end(address, serial);
 }
 bool gx2_render_query_result(uint32_t address, uint32_t output, uint8_t* mem) {
     if (!output || !rbrew_memory_accessible(mem, output, 8)) return false;
     rbrew_write64(mem, output, 0);
     auto* q = find_query(mem, address); uint64_t samples = 0;
+    // Publish ready siblings once so subsequent CPU polls need no queue round-trip.
+    if (q) gx2_render_query_poll();
     if (q && !query_samples(*q, false, samples)) return false;
     if (!address || !rbrew_memory_accessible(mem, address, 64)) return false;
     // GetResult is a CPU data query in gx2.rpl: copied counter blocks and CPU
@@ -4038,6 +4203,14 @@ void gx2_render_conditional_end() { S.conditional_draw = true; }
 // GX2Flush / GX2DrawDone (gx2_vk_context.cpp)
 void gx2_render_vk_flush() {
     if (!gx2vk::ready()) return;
+    // GX2Flush only submits: the CPU may read GPU results after GX2DrawDone
+    // (published there), and draws that read pending exports publish first.
+    // Publishing here waited for the GPU twice per frame (22% of the render
+    // thread in the 2026-10-24 tutorial profile, which the game thread then
+    // waited for in occlusion-query reads). RBREW_STREAMOUT_FLUSH_PUBLISH=1
+    // restores it; RBREW_STREAMOUT_EAGER=1 still publishes before every draw.
+    static const bool publish = [] { const char* v = std::getenv("RBREW_STREAMOUT_FLUSH_PUBLISH"); return v && v[0] == '1'; }();
+    if (s_streamout_batch.pending_count && (publish || !streamouts_lazy())) flush_streamouts(s_last_mem);
     end_rendering();
     gx2vk::submit(false);
     gx2_render_query_poll();
@@ -4046,8 +4219,14 @@ bool gx2_render_vk_finish() {
     if (!gx2vk::ready()) return false;
     end_rendering();
     const bool ok = gx2vk::finish();
+    // GX2DrawDone: the guest may read exported data now (GPU already idle).
+    if (ok && s_streamout_batch.pending_count) flush_streamouts(s_last_mem);
     gx2_render_query_poll();
     return ok;
+}
+// Texture uploads read guest storage at bind time (gx2_render_vk.cpp).
+void gx2r_streamout_flush_if_overlaps(uint8_t* mem, uint32_t address, uint64_t size) {
+    flush_streamouts_if_overlaps(mem, address, size);
 }
 
 // ---------------------------------------------------------------------------
@@ -4279,7 +4458,7 @@ void gx2r::shutdown_draw_state() {
     for (auto& [key, program] : s_prog_by_source) release_program_layouts(*program);
     s_prog_cache.clear(); s_prog_by_source.clear(); s_exact_reads.clear(); s_exact_key_memos.clear(); s_last_exact_key_memo = nullptr; s_canonical.clear(); s_canonical_reuses = 0; warm_reset(); s_compile_queue.reset(); s_next_program = 1;
     {std::lock_guard lock(s_layout_mutex);s_program_layouts.clear();}
-    for(unsigned i=0;i<4;++i) {gx2vk::destroy_buffer(s_streamout_data[i]);gx2vk::destroy_buffer(s_streamout_counter[i]);}
+    for(size_t b = 0; b < StreamOutBatch::kMaxBatch; ++b) { for(unsigned i = 0; i < 4; ++i) { gx2vk::destroy_buffer(s_streamout_batch.pool_data[b][i]); gx2vk::destroy_buffer(s_streamout_batch.pool_counter[b][i]); } } s_streamout_batch.pending_count = 0;
     s_streamout_limits_valid=false;
     for (auto& [key, pipeline] : s_transfer_pipelines) if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
     s_transfer_pipelines.clear();

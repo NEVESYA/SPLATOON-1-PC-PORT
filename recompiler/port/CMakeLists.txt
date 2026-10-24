@@ -48,6 +48,7 @@ add_library(gambit_runtime STATIC
     os/gx2/gx2_write_watch.cpp
     os/gx2/gx2_fetch_decode.cpp
     os/snd_core/snd_core.cpp
+    os/vpad/game_controllers.cpp
     os/vpad/vpad.cpp
     os/padscore/padscore.cpp
     os/stubs/stubs.cpp
@@ -55,6 +56,8 @@ add_library(gambit_runtime STATIC
     os/game/player_anim.cpp
     loader/gambit_loader.cpp
     loader/native_console_profile.cpp
+    runtime/splatoon_diagnostics.cpp
+    runtime/discord_rpc.cpp
 )
 
 target_include_directories(gambit_runtime PUBLIC
@@ -117,11 +120,35 @@ option(RBREW_BUILD_GAME "Build a private, locally generated game" ${RBREW_GAME_D
 if(RBREW_BUILD_GAME)
 file(GLOB GAMBIT_PARTS "${GAMBIT_GENERATED_DIR}/Gambit_part*.cpp")
 
-add_executable(Gambit
-    main.cpp
+add_library(gambit_generated OBJECT
     ${GAMBIT_PARTS}
     ${GAMBIT_GENERATED_DIR}/Gambit_data.cpp
     ${GAMBIT_GENERATED_DIR}/Gambit_register.cpp
+)
+
+target_include_directories(gambit_generated PRIVATE
+    ${GAMBIT_GENERATED_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    ${SDL2_INCLUDE_DIRS}
+)
+
+target_compile_definitions(gambit_generated PRIVATE
+    RBREW_DISABLE_LOGGING
+    HAVE_SDL2
+)
+
+if(MSVC)
+    if(CMAKE_GENERATOR MATCHES "Visual Studio")
+        target_compile_options(gambit_generated PRIVATE /MP)
+    endif()
+    target_compile_options(gambit_generated PRIVATE "$<$<CONFIG:Debug>:/Od>" /bigobj /Ob1 /GS- /Gy- /EHs-c- /GR-)
+    if(EXISTS "${GAMBIT_GENERATED_DIR}/Gambit.h")
+        target_precompile_headers(gambit_generated PRIVATE "${GAMBIT_GENERATED_DIR}/Gambit.h")
+    endif()
+endif()
+
+add_executable(Gambit
+    main.cpp
 )
 
 target_include_directories(Gambit PRIVATE
@@ -130,7 +157,7 @@ target_include_directories(Gambit PRIVATE
     ${SDL2_INCLUDE_DIRS}
 )
 
-target_link_libraries(Gambit PRIVATE gambit_runtime)
+target_link_libraries(Gambit PRIVATE gambit_generated gambit_runtime)
 set_target_properties(Gambit PROPERTIES OUTPUT_NAME Splatoon)
 endif()
 if(WIN32)
@@ -192,8 +219,9 @@ if(MSVC)
         # Guest stores read a constant-initialized static TLS flag
         # (rebrewu_runtime.h); the executable needs no per-access TLS guard.
         target_compile_options(Gambit PRIVATE /Zc:tlsGuards-)
+        target_link_options(Gambit PRIVATE "/MAP:$<TARGET_FILE_DIR:Gambit>/Splatoon.map")
     endif()
-    target_compile_options(gambit_runtime PRIVATE /utf-8 /MP4)
+    target_compile_options(gambit_runtime PRIVATE /utf-8 /MP)
 endif()
 
 # Optimize host-runtime boundaries without recompiling the large generated
@@ -237,6 +265,12 @@ endif()
 option(RBREW_BUILD_TESTS "Build Nintendo-free native performance regression tests" OFF)
 if(RBREW_BUILD_TESTS)
     enable_testing()
+    # Local developer tests/tools below are optional (not in the public tree).
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_frame_pacing.cpp")
+        add_executable(gambit_frame_pacing_tests ../tests/test_frame_pacing.cpp)
+        target_include_directories(gambit_frame_pacing_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME native_frame_pacing COMMAND gambit_frame_pacing_tests)
+    endif()
     add_executable(gambit_texture_bench ../tests/test_texture_streaming.cpp)
     target_link_libraries(gambit_texture_bench PRIVATE gambit_runtime)
     target_include_directories(gambit_texture_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -316,7 +350,7 @@ if(RBREW_BUILD_TESTS)
     if(MSVC)
         target_compile_options(gambit_performance_tests PRIVATE /utf-8)
     endif()
-    foreach(case timing uploads textures queue detile compiler)
+    foreach(case timing uploads textures queue queries detile compiler)
         add_test(NAME native_${case} COMMAND gambit_performance_tests ${case})
         set_tests_properties(native_${case} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     endforeach()
@@ -336,6 +370,26 @@ if(RBREW_BUILD_TESTS)
         add_test(NAME efficiency_${case} COMMAND gambit_efficiency_tests ${case})
         set_tests_properties(efficiency_${case} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     endforeach()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/splport_analyze.cpp")
+        add_executable(splport_analyze tools/splport_analyze.cpp)
+        target_link_libraries(splport_analyze PRIVATE gambit_runtime)
+        target_include_directories(splport_analyze PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        if(MSVC)
+            target_compile_options(splport_analyze PRIVATE /utf-8)
+        endif()
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_compatibility.cpp")
+        add_executable(gambit_compatibility_tests ../tests/test_compatibility.cpp)
+        target_link_libraries(gambit_compatibility_tests PRIVATE gambit_runtime)
+        target_include_directories(gambit_compatibility_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        if(MSVC)
+            target_compile_options(gambit_compatibility_tests PRIVATE /utf-8)
+        endif()
+        foreach(case hiz aux account network padscore)
+            add_test(NAME compatibility_${case} COMMAND gambit_compatibility_tests ${case})
+            set_tests_properties(compatibility_${case} PROPERTIES TIMEOUT 30)
+        endforeach()
+    endif()
 endif()
 
 # The developer test sources are not part of the public tree.

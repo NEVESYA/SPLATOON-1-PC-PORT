@@ -86,6 +86,52 @@ void draw_native_pixels(gx2r::ColorTarget& target) {
     const auto* outside=pixels.data()+(size_t(y)*width+x)*4;
     require(outside[0]==(x%2?255:0) && outside[1]==(y%2?255:0) && outside[2]==0,"scissor clear changed pixels outside the guest rectangle");
 }
+void check_alias_history() {
+    gx2_render_init();
+    std::vector<uint8_t> mem(1u << 20);
+    auto& state = gx2r::state();
+    // Reused guest addresses have many historical shapes. Keep real GPU
+    // images so the test exercises production selection and live writes.
+    for (unsigned width = 1; width < 80; ++width) {
+        const auto old = surface(0x10000, width, 8, 0x1A);
+        gx2_render_set_color_buffer(1, mem.data(), old.data(), 0);
+    }
+    auto texture = surface(0x10000, 80, 8, 0x1A);
+    gx2_render_set_color_buffer(1, mem.data(), texture.data(), 0);
+    auto* target = state.color_targets[0];
+    word(texture, GX2TEX_VIEW_NUM_MIPS, 1); word(texture, GX2TEX_VIEW_FIRST_SLICE, 0); word(texture, GX2TEX_VIEW_NUM_SLICES, 1);
+    word(texture, GX2TEX_COMP_MAP, 0x06880000);
+    gx2_render_bind_texture(1, 0, mem.data(), texture.data());
+    require(state.units[0][0] && state.units[0][0]->image == &target->image, "historical texture view selected");
+    const auto before = gx2_render_texture_alias_probe_count();
+    for (unsigned i = 0; i < 2000; ++i) {
+        gx2_render_bind_texture(1, i % 2, mem.data(), texture.data());
+        require(state.units[i % 2][0] && state.units[i % 2][0]->image == &target->image, "view cache changed across texture units");
+    }
+    const auto probes = gx2_render_texture_alias_probe_count() - before;
+    require(probes <= 2000, "binding rescanned incompatible historical render targets");
+    // A negative result must be invalidated when a matching target appears.
+    const auto added_surface = surface(0x10000, 81, 8, 0x1A);
+    auto missing = added_surface;
+    word(missing, GX2TEX_VIEW_NUM_MIPS, 1); word(missing, GX2TEX_VIEW_FIRST_SLICE, 0); word(missing, GX2TEX_VIEW_NUM_SLICES, 1);
+    word(missing, GX2TEX_COMP_MAP, 0x06880000);
+    gx2_render_bind_texture(1, 0, mem.data(), missing.data());
+    gx2_render_set_color_buffer(1, mem.data(), added_surface.data(), 0);
+    auto* added = state.color_targets[0];
+    gx2_render_bind_texture(1, 0, mem.data(), missing.data());
+    require(state.units[0][0]->image == &added->image, "negative view cache survived a new target");
+    for (const float red : {0.25f, 0.75f}) {
+        VkClearColorValue color{}; color.float32[0] = red; color.float32[3] = 1;
+        gx2r::clear_image_color(added->image, color);
+        gx2_render_bind_texture(1, 0, mem.data(), missing.data());
+        std::vector<uint8_t> pixels;
+        require(gx2vk::read_image(*state.units[0][0]->image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 81, 8, pixels), "alias readback failed");
+        require(std::abs(int(pixels[0]) - int(std::lround(red * 255))) <= 1, "cached alias lost live GPU contents");
+    }
+    require(gx2vk::validation_error_count() == 0, "alias lookup caused Vulkan validation errors");
+    gx2_render_shutdown();
+    std::printf("Alias history: 2000 binds, %llu compatible probes; insertion and live pixels preserved\n", (unsigned long long)probes);
+}
 void check_resolution(VkExtent2D display) {
     gx2_render_init();
     require(gx2_render_set_display_resolution(display.width,display.height),"display selection failed");
@@ -186,6 +232,7 @@ int main(int argc,char**) {
             SDL_Quit(); return 0;
         }
         if(!gx2vk::init(nullptr)) return 77;
+        check_alias_history();
         for(const auto display: {VkExtent2D{1920,1080}, {1366,768}, {2560,1440}, {3840,2160}, {1024,768}, {960,540}, {1280,720}})
             check_resolution(display);
         return 0;

@@ -79,3 +79,6 @@ void gx2_render_copy_surface(const uint8_t*,uint32_t,uint32_t,const uint8_t*,uin
 void gx2_render_capture_next_draw(const char*) {}
 bool gx2_render_replay_capture(const char*, uint8_t*, void (*)(uint32_t, uint32_t), Gx2ReplayResult&) { return false; }
 void gx2_render_shutdown() {}
+
+void gx2_query_render_end(uint32_t, uint64_t) {}
+uint64_t gx2_render_completed_serial() { return 0; }

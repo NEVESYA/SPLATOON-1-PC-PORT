@@ -14,6 +14,7 @@
 #include "gx2_surface_layout.h"
 #include "gx2_state_api.h"
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <unordered_map>
 #include <stdio.h>
@@ -109,60 +110,125 @@ static void GX2SetPrimitiveRestartIndex(CPUState *cpu) { const Gx2RegisterWrite 
 // address; the renderer records which begin's counters it published into
 // guest memory. Once the newest begin is published, GX2QueryGetOcclusionResult
 // reads those counters without waiting behind queued render work - the value
-// the renderer path computes. Anything else (not yet published, or begins
-// inside display lists, which may replay any number of times) waits as before.
+// the renderer path computes. Listed queries also qualify when no queued or
+// executing command can precede this read with another begin.
 namespace {
-struct QueryGeneration { uint64_t issued = 0, executed = 0, published = 0; bool listed = false; };
+struct QueryGeneration { uint64_t issued = 0, executed = 0, published = 0; bool listed = false; bool ended = false; uint64_t serial = UINT64_MAX; };
 std::mutex s_query_generation_mutex;
 std::unordered_map<uint32_t, QueryGeneration> s_query_generations;
 }
 void gx2_query_render_begin(uint32_t address) {
   std::lock_guard lock(s_query_generation_mutex);
-  ++s_query_generations[address].executed;
+  auto& g = s_query_generations[address];
+  ++g.executed;
+  g.ended = false;
+  g.serial = UINT64_MAX;
+}
+void gx2_query_render_end(uint32_t address, uint64_t serial) {
+  std::lock_guard lock(s_query_generation_mutex);
+  auto& g = s_query_generations[address];
+  g.ended = true;
+  g.serial = serial;
 }
 void gx2_query_render_published(uint32_t address) {
   std::lock_guard lock(s_query_generation_mutex);
   auto& g = s_query_generations[address];
   g.published = g.executed;
 }
-static void note_query_issued(uint32_t address, bool listed) {
-  std::lock_guard lock(s_query_generation_mutex);
-  auto& g = s_query_generations[address];
-  if (listed) g.listed = true; else ++g.issued;
-}
-static bool query_result_published(uint32_t address) {
+#ifdef RBREW_ADVANCED_TESTS
+std::atomic<uint64_t> s_query_fast_reads{0};
+uint64_t gx2_query_fast_read_count_for_test() { return s_query_fast_reads.load(); }
+#endif
+static bool read_published_query(uint32_t address, uint8_t* mem, uint64_t& samples) {
   std::lock_guard lock(s_query_generation_mutex);
   const auto it = s_query_generations.find(address);
   if (it == s_query_generations.end()) return false;
   const auto& g = it->second;
-  return !g.listed && g.issued && g.issued == g.executed && g.published == g.executed;
+  if (!g.executed || g.published != g.executed) return false;
+  if (g.issued > g.executed) return false;
+  samples = 0;
+  for (unsigned rb = 0; rb < 4; ++rb) {
+    const uint64_t start = rbrew_bswap64(rbrew_read64(mem, address + rb * 16));
+    const uint64_t end = rbrew_bswap64(rbrew_read64(mem, address + rb * 16 + 8));
+    if (!(start & (1ull << 63)) || !(end & (1ull << 63))) return false;
+    samples += end - start;
+  }
+#ifdef RBREW_ADVANCED_TESTS
+  ++s_query_fast_reads;
+#endif
+  return true;
 }
 static void apply_query_begin(CPUState* cpu) { gx2_render_query_begin(ARG0,ARG1,MEM); }
 static void GX2QueryBegin(CPUState* cpu) {
-  note_query_issued(ARG1, gx2_dl_list_open());
-  if(gx2_dl_recording()) {
-    // The CPU query helper in gx2.rpl clears its data immediately, including
-    // while command recording. GPU-memory queries defer that write to replay.
-    if(ARG0==0 && ARG1 && rbrew_memory_accessible(MEM,ARG1,64)) {
+  const bool recording = gx2_dl_recording(), listed = gx2_dl_list_open();
+  {
+    std::lock_guard lock(s_query_generation_mutex);
+    auto& g = s_query_generations[ARG1];
+    if (listed) g.listed = true; else ++g.issued;
+    // Serialize immediate CPU clears with reads of already-published counters.
+    if(recording && ARG0==0 && ARG1 && rbrew_memory_accessible(MEM,ARG1,64)) {
       const uint8_t zero[64]{};rbrew_write_memory(MEM,ARG1,zero,64);
     }
+  }
+  if(recording) {
     gx2_dl_record(apply_query_begin,cpu);return;
   }
   apply_query_begin(cpu);
 }
 static void GX2QueryEnd(CPUState* cpu) { gx2_render_query_end(ARG0,ARG1,MEM); }
+// How a read whose begin is still queued on the render thread is answered.
+// Gambit's only caller (027E99AC) polls the oldest query of a ring and retries
+// a FALSE next frame, so "not ready" is fine for an immediate begin: it is
+// executed within the frame. A query that was ever begun from a display list
+// is marked `listed` for good and has no issue count; answering those "not
+// ready" while the queue was busy (it nearly always is) stalled the ring for
+// good and broke UI, ink and physics. They still wait for the queue.
+// RBREW_QUERY_ASYNC=0: every queued read waits (the safe old behaviour);
+// =1: listed queries too answer "not ready" (the broken first attempt).
+enum class QueryAsync { Wait, Immediate, All };
+static QueryAsync query_async_mode() {
+  static const QueryAsync mode = [] {
+    const char* value = std::getenv("RBREW_QUERY_ASYNC");
+    if (value && *value == '0') return QueryAsync::Wait;
+    if (value && *value == '1') return QueryAsync::All;
+    return QueryAsync::Immediate;
+  }();
+  return mode;
+}
 static void GX2QueryGetOcclusionResult(CPUState* cpu) {
-  // Same counter evaluation as gx2_render_query_result after publication.
+  uint64_t samples = 0;
   if (gx2_native_async_active() && ARG1 && rbrew_memory_accessible(MEM,ARG1,8) &&
-      rbrew_memory_accessible(MEM,ARG0,64) && query_result_published(ARG0)) {
-    uint64_t samples = 0; bool complete = true;
-    for (unsigned rb = 0; rb < 4 && complete; ++rb) {
-      const uint64_t start = rbrew_bswap64(rbrew_read64(MEM, ARG0 + rb * 16));
-      const uint64_t end = rbrew_bswap64(rbrew_read64(MEM, ARG0 + rb * 16 + 8));
-      complete = (start & (1ull << 63)) && (end & (1ull << 63));
-      samples += end - start;
+      rbrew_memory_accessible(MEM,ARG0,64)) {
+    if (read_published_query(ARG0,MEM,samples)) {
+      rbrew_write64(MEM, ARG1, samples); RET = 1; return;
     }
-    if (complete) { rbrew_write64(MEM, ARG1, samples); RET = 1; return; }
+    bool not_ready = false;
+    {
+      std::lock_guard lock(s_query_generation_mutex);
+      const auto it = s_query_generations.find(ARG0);
+      if (it != s_query_generations.end()) {
+        const auto& g = it->second;
+        if (g.issued > g.executed || (g.listed && !gx2_native_queue_idle())) {
+          // The begin (or the list containing it) is still queued for the
+          // render thread, so the GPU cannot have produced this result yet.
+          // Waiting drains the whole render queue and serializes the game
+          // thread with the renderer (~50% of game-thread time in the
+          // 2026-10-24 tutorial profiles). An immediate begin answers "not
+          // ready" instead (see query_async_mode). If the queue is idle while
+          // issued > executed, the renderer dropped that begin: fall through
+          // to the sync path.
+          const QueryAsync mode = query_async_mode();
+          const bool immediate = g.issued > g.executed && !g.listed;
+          if ((mode == QueryAsync::All || (mode == QueryAsync::Immediate && immediate)) && !gx2_native_queue_idle())
+            not_ready = true;
+        } else if (!g.ended || g.serial > gx2_render_completed_serial()) {
+          not_ready = true;
+        }
+      }
+    }
+    if (not_ready) {
+      RET = 0; return;
+    }
   }
   uint32_t result = 0;
   gx2_native_run(true, [&] { result = gx2_render_query_result(ARG0,ARG1,MEM) ? 1 : 0; });
@@ -593,19 +659,26 @@ static void GX2CalcSurfaceSizeAndAlignment(CPUState *cpu) {
 }
 
 static void GX2CalcColorBufferAuxInfo(CPUState *cpu) {
-  RBREW_LOGF(stderr,
-          "[gx2] GX2CalcColorBufferAuxInfo is unsupported without the exact "
-          "AddrLib auxiliary-layout calculation (buffer=%08X, output=%08X)\n",
-          ARG0, ARG1);
-  (void)cpu;
+  // Vulkan renderer does not emulate hardware CMask/FMASK aux buffers.
+  // Returning size 0 ensures the guest allocates standard color buffers without aux compression metadata.
+  if (ARG0 && rbrew_memory_accessible(MEM, ARG0, GX2CB_SIZEOF))
+    rbrew_write32(MEM, ARG0 + GX2CB_AA_SIZE, 0);
+  if (ARG1 && rbrew_memory_accessible(MEM, ARG1, 4))
+    rbrew_write32(MEM, ARG1, 0);
+  if (ARG2 && rbrew_memory_accessible(MEM, ARG2, 4))
+    rbrew_write32(MEM, ARG2, 256);
 }
 
 static void GX2CalcDepthBufferHiZInfo(CPUState *cpu) {
-  RBREW_LOGF(stderr,
-          "[gx2] GX2CalcDepthBufferHiZInfo is unsupported without the exact "
-          "AddrLib HiZ-layout calculation (buffer=%08X, size=%08X, alignment=%08X)\n",
-          ARG0, ARG1, ARG2);
-  (void)cpu;
+  // Vulkan renderer does not emulate hardware HiZ metadata or fast clear.
+  // Returning size 0 prevents the guest from enabling hardware HiZ early-Z culling,
+  // which otherwise culls 100% of 3D geometry fragments.
+  if (ARG0 && rbrew_memory_accessible(MEM, ARG0, GX2DB_SIZEOF))
+    rbrew_write32(MEM, ARG0 + GX2DB_HIZ_SIZE, 0);
+  if (ARG1 && rbrew_memory_accessible(MEM, ARG1, 4))
+    rbrew_write32(MEM, ARG1, 0);
+  if (ARG2 && rbrew_memory_accessible(MEM, ARG2, 4))
+    rbrew_write32(MEM, ARG2, 2048);
 }
 
 static std::optional<RbrewGx2SurfaceLayout> buffer_register_layout(CPUState* cpu,uint32_t bytes) {

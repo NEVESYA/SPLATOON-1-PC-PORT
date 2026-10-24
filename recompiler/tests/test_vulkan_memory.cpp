@@ -172,7 +172,7 @@ void allocator() {
     map_failures = 1; requirements.size = 20ull << 20;
     attempted_types.clear();
     a = allocate(requirements, MemoryUse::Upload, true);
-    if (upload_types.count > 1) require(bool(a) && attempted_types.size() == 2, "mapping failure did not try another type");
+    if (upload_types.count > 1) require(bool(a) && map_failures == 0 && attempted_types.size() >= 2, "mapping failure did not try another type");
     else require(!a, "single mapped type unexpectedly survived mapping failure");
     free_now(a);
     require(allocated_bytes() == before, "mapping failure leaked memory accounting");

@@ -20,6 +20,8 @@
 
 #include "../os_common.h"
 #include "../../runtime/host_sleep.h"
+#include <array>
+#include <cstdlib>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -274,10 +276,46 @@ static void OSInitThreadQueue(CPUState* cpu)   {
         memset(MEM + ARG0, 0, 8);
 }
 
+// RBREW_SLEEP_TRACE=<file>: total guest sleep time per guest call chain (the
+// return addresses of the four innermost frames), rewritten every 2 s.
+static void trace_sleep(CPUState* cpu, uint64_t us) {
+    static const char* const path = std::getenv("RBREW_SLEEP_TRACE");
+    if (!path || !*path) return;
+    std::array<uint32_t, 4> chain{cpu->lr};
+    for (uint32_t i = 1, sp = cpu->r[1]; i < chain.size(); ++i) {
+        if (!rbrew_memory_accessible(MEM, sp, 4)) break;
+        sp = rbrew_read32(MEM, sp);   // back chain
+        if (!sp || !rbrew_memory_accessible(MEM, sp + 4, 4)) break;
+        chain[i] = rbrew_read32(MEM, sp + 4);   // saved LR
+    }
+    struct Hash { size_t operator()(const std::array<uint32_t, 4>& c) const { return c[0] ^ c[1] * 31 ^ c[2] * 131 ^ c[3] * 1031; } };
+    static std::mutex lock;
+    struct Total { uint64_t calls = 0, us = 0; double first_s = 0, last_s = 0; };
+    static std::unordered_map<std::array<uint32_t, 4>, Total, Hash> totals;
+    static const auto start = std::chrono::steady_clock::now();
+    static auto last_dump = start;
+    std::lock_guard guard(lock);
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - start).count();
+    auto& total = totals[chain];
+    if (!total.calls++) total.first_s = seconds;
+    total.us += us; total.last_s = seconds;
+    if (now - last_dump < std::chrono::seconds(2)) return;
+    last_dump = now;
+    if (FILE* f = std::fopen(path, "w")) {
+        std::fprintf(f, "calls total_ms first_s last_s lr0 lr1 lr2 lr3\n");
+        for (const auto& [c, t] : totals)
+            std::fprintf(f, "%llu %.1f %.1f %.1f %08X %08X %08X %08X\n", (unsigned long long)t.calls, t.us / 1000.0,
+                         t.first_s, t.last_s, c[0], c[1], c[2], c[3]);
+        std::fclose(f);
+    }
+}
+
 static void OSSleepTicks(CPUState* cpu) {
     // Ticks of the OS timer (bus clock / 4); the full duration is slept.
     uint64_t ticks = ((uint64_t)ARG0 << 32) | (uint64_t)ARG1;
     uint64_t us = ticks / RBREW_TIMER_CLOCK * 1000000ULL + ticks % RBREW_TIMER_CLOCK * 1000000ULL / RBREW_TIMER_CLOCK;
+    trace_sleep(cpu, us);
     if (us > 0)
         rbrew_host_sleep_for(us);
 }

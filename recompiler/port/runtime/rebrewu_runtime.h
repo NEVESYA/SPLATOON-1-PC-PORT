@@ -50,7 +50,11 @@ typedef void (*HostFunc)(CPUState* cpu);
 // succeeds, and clear it before destroying or reusing the arena allocation.
 extern "C" RBREW_HOST_API bool rbrew_overlay_accessible(const uint8_t* mem);
 extern "C" void rbrew_set_overlay_access(uint8_t* mem, bool enabled);
+#if defined(_MSC_VER)
+static __declspec(noinline) bool rbrew_memory_accessible(const uint8_t* mem, uint32_t address, uint64_t size) {
+#else
 static inline bool rbrew_memory_accessible(const uint8_t* mem, uint32_t address, uint64_t size) {
+#endif
     if (!mem || size > WIIU_MEM_SIZE) return false;
     const uint64_t end = uint64_t(address) + size; // widened, bounded size
     if (end <= RBREW_APPLICATION_ARENA_END) return true;

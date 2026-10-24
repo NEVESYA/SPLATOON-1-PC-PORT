@@ -211,6 +211,10 @@ int main(int argc, char** argv) {
     codegen::NamingContext names(rpx.name);
     codegen::EmitConfig emit_config;
     emit_config.emit_ppc_image = opts->emit_ppc_image;
+    emit_config.emit_coverage = opts->emit_coverage;
+    if (opts->functions_per_file.has_value()) {
+        emit_config.functions_per_file = *opts->functions_per_file;
+    }
     if (!opts->hooks_file.empty()) {
         std::ifstream hooks(opts->hooks_file);
         if (!hooks) { std::cerr << "cannot read hooks " << opts->hooks_file << std::endl; return EXIT_FAILURE; }

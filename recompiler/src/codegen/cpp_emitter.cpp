@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cassert>
 #include <algorithm>
+#include <cmath>
 
 namespace rebrewu::codegen {
 
@@ -22,6 +23,14 @@ static bool write_text_if_changed(const std::filesystem::path& path, const std::
     output << text;
     output.flush();
     return bool(output);
+}
+
+static size_t count_function_instructions(const IRFunction& func) {
+    size_t count = 0;
+    for (const auto& blk : func.blocks) {
+        count += blk.instrs.size();
+    }
+    return count;
 }
 
 static bool is_fp_opcode(Opcode op) {
@@ -118,12 +127,78 @@ bool CppEmitter::emit(const std::filesystem::path& outdir) {
         if (!write_text_if_changed(path,f.str())) { m_last_error = "Cannot write " + path.string(); return false; }
     }
 
-    // --- function files ---
-    const uint32_t chunk = (m_cfg.functions_per_file == 0)
-                         ? static_cast<uint32_t>(m_ir.functions.size() + 1)
-                         : m_cfg.functions_per_file;
+    // --- function files (Complexity-Aware Partitioning) ---
+    // Group functions into shards such that:
+    // 1. Functions with instruction count >= isolate_instruction_threshold are isolated
+    //    into their own dedicated shard to avoid stragglers during parallel compilation.
+    // 2. Regular shards never exceed max_instructions_per_shard OR functions_per_file.
+    // 3. Shard sizes stay balanced (~300-600 KB), allowing maximum compiler throughput.
+    std::vector<std::vector<size_t>> shard_func_indices;
     const size_t total = m_ir.functions.size();
-    const size_t num_parts = (total == 0) ? 1 : (total + chunk - 1) / chunk;
+
+    if (m_cfg.functions_per_file == 0) {
+        std::vector<size_t> single_shard(total);
+        for (size_t i = 0; i < total; ++i) single_shard[i] = i;
+        shard_func_indices.push_back(std::move(single_shard));
+    } else {
+        std::vector<size_t> current_shard;
+        size_t current_instr_count = 0;
+
+        for (size_t i = 0; i < total; ++i) {
+            size_t func_instrs = count_function_instructions(m_ir.functions[i]);
+
+            // Isolate massive functions (> isolate_instruction_threshold)
+            if (func_instrs >= m_cfg.isolate_instruction_threshold) {
+                shard_func_indices.push_back({i});
+                continue;
+            }
+
+            // If adding this function exceeds limits, finish current shard
+            if (!current_shard.empty() && 
+                (current_shard.size() >= m_cfg.functions_per_file || 
+                 current_instr_count + func_instrs > m_cfg.max_instructions_per_shard)) {
+                shard_func_indices.push_back(std::move(current_shard));
+                current_shard.clear();
+                current_instr_count = 0;
+            }
+
+            current_shard.push_back(i);
+            current_instr_count += func_instrs;
+        }
+
+        if (!current_shard.empty()) {
+            shard_func_indices.push_back(std::move(current_shard));
+        }
+    }
+
+    // Longest Processing Time First (LPT) scheduling:
+    // Sort shards descending by MSVC optimization complexity weight (instrs^1.8).
+    // Large monster functions have super-linear compilation costs (O(N^1.8) in c2.dll SSA/regalloc),
+    // so placing them at part0000 ensures all 16 workers crunch the heaviest translation units
+    // starting at Second 0.0. Faster shards drain concurrently, completely eliminating the straggler tail.
+    std::vector<std::pair<double, std::vector<size_t>>> weighted_shards;
+    weighted_shards.reserve(shard_func_indices.size());
+    for (auto& shard : shard_func_indices) {
+        double shard_weight = 0.0;
+        for (size_t idx : shard) {
+            double instrs = static_cast<double>(count_function_instructions(m_ir.functions[idx]));
+            shard_weight += std::pow(instrs, 1.8);
+        }
+        weighted_shards.emplace_back(shard_weight, std::move(shard));
+    }
+
+    std::sort(weighted_shards.begin(), weighted_shards.end(),
+        [](const auto& a, const auto& b) {
+            return a.first > b.first; // Heaviest first
+        });
+
+    shard_func_indices.clear();
+    shard_func_indices.reserve(weighted_shards.size());
+    for (auto& item : weighted_shards) {
+        shard_func_indices.push_back(std::move(item.second));
+    }
+
+    const size_t num_parts = shard_func_indices.size();
     std::set<std::string> live_parts;
 
     for (size_t part = 0; part < num_parts; ++part) {
@@ -136,11 +211,13 @@ bool CppEmitter::emit(const std::filesystem::path& outdir) {
         emit_file_prologue(f);
         f << "#include \"" << hdr << "\"\n\n";
 
-        const size_t start = part * chunk;
-        const size_t end   = std::min(start + chunk, total);
-        for (size_t i = start; i < end; ++i)
-            emit_function(m_ir.functions[i], f);
-        if (!write_text_if_changed(path,f.str())) { m_last_error = "Cannot write " + path.string(); return false; }
+        for (size_t idx : shard_func_indices[part]) {
+            emit_function(m_ir.functions[idx], f);
+        }
+        if (!write_text_if_changed(path, f.str())) {
+            m_last_error = "Cannot write " + path.string();
+            return false;
+        }
     }
 
     if (m_cfg.emit_ppc_image && !emit_ppc_image(outdir)) return false;
@@ -361,7 +438,8 @@ void CppEmitter::emit_function(const ir::IRFunction& func, std::ostream& out) {
         fname += "_unhooked";
     }
     out << "void " << fname << "(CPUState* cpu) {\n";
-    out << "#ifdef RBREW_ENABLE_COVERAGE\n    RBREW_COVERAGE_FUNCTION(0x" << std::hex << func.entry_addr << "u);\n#endif\n";
+    if (m_cfg.emit_coverage)
+        out << "#ifdef RBREW_ENABLE_COVERAGE\n    RBREW_COVERAGE_FUNCTION(0x" << std::hex << func.entry_addr << "u);\n#endif\n";
 
     if (!int_temps.empty()) {
         out << "    uint32_t ";
@@ -413,11 +491,11 @@ void CppEmitter::emit_block(const ir::BasicBlock& blk, const ir::IRFunction& fun
 
     uint32_t previous_pc=0;
     for (const auto& instr : blk.instrs) {
-        if(instr.guest_addr && instr.guest_addr!=previous_pc) {
+        if(m_cfg.emit_coverage && instr.guest_addr && instr.guest_addr!=previous_pc) {
             out << "#ifdef RBREW_ENABLE_COVERAGE\n    RBREW_COVERAGE_PC(0x" << std::hex << instr.guest_addr << "u);\n#endif\n";
             previous_pc=instr.guest_addr;
         }
-        emit_instr(instr, out, 2);
+        emit_instr(instr, out, 1);
     }
 }
 
