@@ -18,6 +18,11 @@
 #include "gx2_native_context.h"
 #include "gx2_surface.h"
 #include "gx2_display_list.h"
+#include "../vpad/game_controllers.h"
+#include "../../runtime/splatoon_diagnostics.h"
+#include "../../runtime/benchmark_input.h"
+#include "../../runtime/native_control_defaults.h"
+#include "../../runtime/discord_rpc.h"
 #include <cstdlib>
 #include <string>
 #include <stdio.h>
@@ -56,11 +61,30 @@ static unsigned s_fps_frames = 0;
 static double s_window_fps = 0;
 static void update_window_title() {
     if (!s_window) return;
-    constexpr const char* backend = "Vulkan";
-    char title[192];
-    std::snprintf(title, sizeof(title), "Splatoon | %s | %s | %.1f FPS  (Tab = switch | F11 = fullscreen | F3 = FPS overlay)",
-                  backend, g_screen_mode == ScreenMode::TV ? "TV" : "Gamepad", s_window_fps);
-    SDL_SetWindowTitle(s_window, title);
+    auto metrics = SplatoonDiagnostics::GetOverlayMetrics();
+    char title_buf[256];
+    if (SplatoonDiagnostics::IsDetailedOverlay()) {
+        std::snprintf(title_buf, sizeof(title_buf),
+                     "Splatoon | %s | %.1f FPS (%.1fms) | 1%%: %.1f | P95: %.1fms P99: %.1fms | RAM: %uMB [F4=Off | Tab=View | F11=Win]",
+                     g_screen_mode == ScreenMode::TV ? "TV" : "Gamepad",
+                     metrics.avg_fps > 0.0f ? metrics.avg_fps : float(s_window_fps),
+                     metrics.frame_time_ms, metrics.low_1pct_fps,
+                     metrics.p95_frame_time_ms, metrics.p99_frame_time_ms,
+                     unsigned(metrics.ram_usage_bytes / (1024 * 1024)));
+    } else if (SplatoonDiagnostics::IsOverlayVisible()) {
+        std::snprintf(title_buf, sizeof(title_buf),
+                     "Splatoon | %s | %.1f FPS (%.1fms) | 1%% Low: %.1f | CPU: %.1fms [F3=Off | Tab=View | F11=Win]",
+                     g_screen_mode == ScreenMode::TV ? "TV" : "Gamepad",
+                     metrics.avg_fps > 0.0f ? metrics.avg_fps : float(s_window_fps),
+                     metrics.frame_time_ms, metrics.low_1pct_fps, metrics.cpu_time_ms);
+    } else {
+        std::snprintf(title_buf, sizeof(title_buf),
+                     "Splatoon | Vulkan | %s | %.1f FPS (%.1fms) [F3=FPS | F4=Stats | Tab=View | F11=Win]",
+                     g_screen_mode == ScreenMode::TV ? "TV" : "Gamepad",
+                     metrics.avg_fps > 0.0f ? metrics.avg_fps : float(s_window_fps),
+                     metrics.frame_time_ms);
+    }
+    SDL_SetWindowTitle(s_window, title_buf);
 }
 
 // Switch between TV and Gamepad view, adjusting mouse capture accordingly
@@ -146,8 +170,10 @@ static bool gx2_platform_open_window() {
     // Keep reading the controller while another window has focus.
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
-        RBREW_LOGF(stderr, "[gx2] SDL_Init failed: %s\n", SDL_GetError());
+    SplatoonDiagnostics::Init();
+    init_game_controllers();
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC | SDL_INIT_SENSOR) != 0) {
+        controller_log("SDL_Init failed: %s\n", SDL_GetError());
         return false;
     }
     // Vulkan presentation: no GPU attributes or context. The device and
@@ -155,7 +181,7 @@ static bool gx2_platform_open_window() {
     // mode avoids a second refresh wait (see gx2_vk.cpp create_swapchain).
     SDL_DisplayMode desktop{};
     if (SDL_GetDesktopDisplayMode(0, &desktop) != 0 || desktop.w <= 0 || desktop.h <= 0) return false;
-    s_window = SDL_CreateWindow("Splatoon | Vulkan | TV",
+    s_window = SDL_CreateWindow("Splatoon Native PC Port",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         desktop.w, desktop.h, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
         SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_FULLSCREEN_DESKTOP);
@@ -220,6 +246,7 @@ static void GX2Init(CPUState* cpu) {
 // GX2Shutdown()
 static void GX2Shutdown(CPUState* cpu) {
 #if defined(HAVE_SDL2)
+    SplatoonDiagnostics::Shutdown();
     gx2_native_stop_render_thread();
     gx2_render_shutdown();
     if (s_window) { SDL_DestroyWindow(s_window);   s_window = nullptr; }
@@ -449,29 +476,111 @@ static void GX2Flush(CPUState* cpu) {
 
 // Swap bookkeeping (gx2.rpl: swap counter DAT_10015620, flip counter
 // DAT_10016140, last flip / last vsync OSTime pairs). On the console the
-// GPU bumps the flip counter when a queued frame reaches the scan-out; here
-// GX2SwapScanBuffers presents synchronously, so the frame is flipped by the
-// time it returns.
+// GPU bumps the flip counter when a queued frame reaches the scan-out. The
+// host retires a guest frame after the render thread has consumed its data
+// and queued presentation; Vulkan scan-out itself remains asynchronous.
 static std::atomic<uint32_t> s_swap_count{0};
 static std::atomic<uint32_t> s_flip_count{0};
 static std::atomic<uint64_t> s_last_flip{0};
 static std::atomic<uint64_t> s_last_vsync{0};
+static std::atomic<float>    s_last_vsync_wait_ms{0.0f};
+static std::atomic<float>    s_last_present_wait_ms{0.0f};
+static std::atomic<uint32_t> s_swap_interval{1};
+
+// GX2SetSwapInterval(interval): vblanks between flips (0 = flip at once).
+static void GX2SetSwapInterval(CPUState* cpu) {
+    s_swap_interval.store(ARG0, std::memory_order_relaxed);
+}
+
+// The console flips a swapped frame at the first vblank after the frame is
+// done that is also at least `interval` vblanks after the previous flip, and
+// the game paces itself on the flip counter. Flipping as soon as the frame was
+// presented let it run at 90-100 FPS with game logic and camera sped up.
+// Default "auto": a single late frame flips at once (no drop to 30 FPS in the
+// 60 FPS tutorial), but a scene whose frames take longer than a vblank most of
+// the time (the plaza, ~25 ms) is held at a steady two vblanks per frame, as
+// the console shows it, instead of alternating 26/33 ms. Hysteresis keeps it
+// from toggling. RBREW_FRAME_PACING=vsync waits for the next vblank on every
+// late frame (console-strict: drops to 30 on any slow frame), =adaptive never
+// holds 30, =0 restores the immediate flip.
+static void pace_flip() {
+    // Default: adaptive (60 FPS cap, a late frame flips at once, never held at
+    // 30). The user wants a steady 60 everywhere; "auto" (hold 30 in heavy
+    // scenes) and "vsync" (console-strict) stay available for testing.
+    static const int mode = [] {   // 0 off, 1 vblank-quantized, 2 adaptive, 3 auto
+        const char* v = std::getenv("RBREW_FRAME_PACING");
+        if (v && v[0] == '0') return 0;
+        if (v && !std::strcmp(v, "auto")) return 3;
+        if (v && !std::strcmp(v, "vsync")) return 1;
+        return 2;
+    }();
+    const uint32_t interval = s_swap_interval.load(std::memory_order_relaxed);
+    if (!mode || !interval) return;
+    const uint64_t cycle = uint64_t(RBREW_TIMER_CLOCK) * 1001;   // 60000 vblanks per cycle
+    const auto vblank_index = [cycle](uint64_t ticks) { return (ticks / cycle) * 60000 + (ticks % cycle) * 60000 / cycle; };
+    static uint64_t s_last_flip_index = 0, s_last_flip_ticks = 0;   // swap thread only
+    static uint8_t s_slow[30]{}; static unsigned s_slow_head = 0, s_slow_count = 0;
+    static bool s_half_rate = false;
+    const uint64_t now_ticks = rbrew_system_ticks();
+    const uint64_t now_index = vblank_index(now_ticks);
+    uint32_t effective = interval;
+    if (mode == 3 && s_last_flip_ticks) {
+        // Frame work: last flip to this swap, minus the game's own vsync waits
+        // and the present wait (at 30 FPS the game waits longer itself; counting
+        // that kept the lock on after a loading screen). Slow = missed a vblank.
+        const double work_ms = double(now_ticks - s_last_flip_ticks) * 1000.0 / RBREW_TIMER_CLOCK -
+            s_last_vsync_wait_ms.load(std::memory_order_relaxed) - s_last_present_wait_ms.load(std::memory_order_relaxed);
+        const uint8_t slow = work_ms > 17.0 ? 1 : 0, fast = work_ms < 15.0 ? 1 : 0;
+        s_slow_count += slow - s_slow[s_slow_head];   // counts slow frames in the window
+        s_slow[s_slow_head] = slow; s_slow_head = (s_slow_head + 1) % 30;
+        static uint8_t s_fast[30]{}; static unsigned s_fast_head = 0, s_fast_count = 0;
+        s_fast_count += fast - s_fast[s_fast_head];
+        s_fast[s_fast_head] = fast; s_fast_head = (s_fast_head + 1) % 30;
+        if (!s_half_rate && s_slow_count >= 20) s_half_rate = true;
+        else if (s_half_rate && s_fast_count >= 24) s_half_rate = false;
+        if (s_half_rate) effective = std::max(effective, 2u);
+    }
+    const uint64_t target_index = mode == 1 ? std::max(s_last_flip_index + effective, now_index + 1)
+                                            : s_last_flip_index + effective;
+    if (s_last_flip_index && target_index > now_index) {
+        Gx2PerfScope perf_scope(kPerfVsync);
+        const auto wait_start = std::chrono::steady_clock::now();
+        const uint64_t target = gx2_vblank_tick(target_index, RBREW_TIMER_CLOCK);
+        rbrew_host_sleep_until(rbrew_boot_time + std::chrono::nanoseconds(
+            target / RBREW_TIMER_CLOCK * 1000000000ull + target % RBREW_TIMER_CLOCK * 1000000000ull / RBREW_TIMER_CLOCK + 1u));
+        s_last_vsync_wait_ms.fetch_add(std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - wait_start).count(),
+                                       std::memory_order_relaxed);
+        s_last_flip_index = target_index;
+    } else {
+        s_last_flip_index = now_index;
+    }
+    s_last_flip_ticks = rbrew_system_ticks();
+}
 
 // GX2WaitForVsync() — blocks until the next vblank (gx2.rpl waits on the
 // vsync event; GX2WaitForFlip/GX2SetSwapInterval poll in loops around it).
 static void GX2WaitForVsync(CPUState* cpu) {
+    const auto vsync_start = std::chrono::steady_clock::now();
     Gx2PerfScope perf_scope(kPerfVsync);
     (void)cpu;
 #if defined(HAVE_SDL2)
     gx2_pump_window_messages();
 #endif
     const uint64_t now = rbrew_system_ticks();
-    const uint64_t target = gx2_next_vblank_tick(now,RBREW_TIMER_CLOCK);
-    if (target > now)
-        rbrew_host_sleep_until(rbrew_boot_time+std::chrono::nanoseconds(
-            target/RBREW_TIMER_CLOCK*1000000000ull+target%RBREW_TIMER_CLOCK*1000000000ull/RBREW_TIMER_CLOCK+1u));
-    uint64_t previous=s_last_vsync.load();
-    while(previous<target && !s_last_vsync.compare_exchange_weak(previous,target)) {}
+    thread_local Gx2VblankWaiter waiter;
+    // (A "skip if present waited > 4 ms" check was removed: the present wait is
+    // reset at the end of every swap, so it never applied.)
+    const uint64_t target = waiter.target(now, RBREW_TIMER_CLOCK);
+    if (target > now) {
+        rbrew_host_sleep_until(rbrew_boot_time + std::chrono::nanoseconds(
+            target / RBREW_TIMER_CLOCK * 1000000000ull + target % RBREW_TIMER_CLOCK * 1000000000ull / RBREW_TIMER_CLOCK + 1u));
+    }
+    waiter.complete(rbrew_system_ticks(), RBREW_TIMER_CLOCK);
+    uint64_t previous = s_last_vsync.load(std::memory_order_relaxed);
+    while (previous < waiter.observed &&
+           !s_last_vsync.compare_exchange_weak(previous, waiter.observed, std::memory_order_relaxed)) {}
+    const float vsync_dur = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - vsync_start).count();
+    s_last_vsync_wait_ms.fetch_add(vsync_dur, std::memory_order_relaxed);
 }
 
 // GX2GetSwapStatus(u32* swapCount, u32* flipCount, OSTime* lastFlip,
@@ -519,8 +628,14 @@ static std::atomic<uint64_t> s_presents_posted{0}, s_presents_done{0};
 // Called every frame — pump SDL events, blit game FBO to window, swap buffers.
 static void GX2SwapScanBuffers(CPUState* cpu) {
     gx2_perf_frame();
+    using frame_clock = std::chrono::steady_clock;
+    static frame_clock::time_point s_prev_swap_tp{};
+    const frame_clock::time_point swap_start_tp = frame_clock::now();
+    check_controller_hotplug_periodic();
     if (s_swap_count.fetch_add(1) == 0)
         RBREW_LOGF(stderr, "[gx2] GX2SwapScanBuffers called for the first time\n");
+    rbrew_benchmark::frame.store(s_swap_count.load(), std::memory_order_relaxed);
+    rbrew::discord_rpc_poll_game_state(cpu ? cpu->mem : nullptr, s_swap_count.load());
 #if defined(HAVE_SDL2)
     if (s_window) {
         // Pump SDL events first
@@ -529,29 +644,59 @@ static void GX2SwapScanBuffers(CPUState* cpu) {
             switch (ev.type) {
             case SDL_QUIT:
                 gx2_close_requested();
+                break;
 
             case SDL_KEYDOWN:
+                if (ev.key.repeat) break;
                 if (ev.key.keysym.scancode == SDL_SCANCODE_TAB) {
                     toggle_screen_mode();
-                } else if (ev.key.keysym.scancode == SDL_SCANCODE_F3 && !ev.key.repeat) {
-                    gx2vk::set_fps_overlay(!gx2vk::fps_overlay());
                 } else if (ev.key.keysym.scancode == SDL_SCANCODE_F11) {
-                    // Toggle fullscreen / windowed
                     bool is_full = (SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
-                    SDL_SetWindowFullscreen(s_window,
-                        is_full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+                    if (is_full) {
+                        SDL_SetWindowFullscreen(s_window, 0);
+                        SDL_SetWindowSize(s_window, 1280, 720);
+                        SDL_SetWindowPosition(s_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                    } else {
+                        SDL_SetWindowFullscreen(s_window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+                    }
+                    update_window_title();
+                } else if (ev.key.keysym.scancode == SDL_SCANCODE_F3) {
+                    // One key for both FPS displays: the in-game overlay
+                    // (documented in README) and the compact title stats.
+                    const bool show = !gx2vk::fps_overlay();
+                    gx2vk::set_fps_overlay(show);
+                    if (SplatoonDiagnostics::IsOverlayVisible() != show) SplatoonDiagnostics::ToggleOverlay();
+                    update_window_title();
+                    controller_log("F3 pressed: Compact overlay visible=%d\n", SplatoonDiagnostics::IsOverlayVisible());
+                } else if (ev.key.keysym.scancode == SDL_SCANCODE_F4) {
+                    SplatoonDiagnostics::ToggleDetailedOverlay();
+                    update_window_title();
+                    controller_log("F4 pressed: Detailed overlay visible=%d\n", SplatoonDiagnostics::IsDetailedOverlay());
+                } else if (ev.key.keysym.scancode == SDL_SCANCODE_F8) {
+                    SplatoonDiagnostics::ToggleManualRecord();
+                    update_window_title();
+                    controller_log("F8 pressed: Manual recording toggled\n");
+                } else if (ev.key.keysym.scancode == SDL_SCANCODE_F9) {
+                    SplatoonDiagnostics::ManualCapture();
+                    update_window_title();
+                    controller_log("F9 pressed: Diagnostic snapshot captured\n");
                 }
                 break;
 
             case SDL_CONTROLLERDEVICEADDED:
-                // SDL2 will make the new controller visible to SDL_IsGameController;
-                // VPADRead re-scans every frame so it picks it up automatically.
-                RBREW_LOGF(stderr, "[vpad] Controller connected (index %d)\n", ev.cdevice.which);
+                on_controller_device_added(ev.cdevice.which);
                 break;
 
             case SDL_CONTROLLERDEVICEREMOVED:
-                RBREW_LOGF(stderr, "[vpad] Controller disconnected (instance %d)\n", ev.cdevice.which);
-                // VPADRead detects SDL_GameControllerGetAttached==false and re-scans.
+                on_controller_device_removed(ev.cdevice.which);
+                break;
+
+            case SDL_JOYDEVICEADDED:
+                on_controller_device_added(ev.jdevice.which);
+                break;
+
+            case SDL_JOYDEVICEREMOVED:
+                on_controller_device_removed(ev.jdevice.which);
                 break;
 
             case SDL_MOUSEBUTTONDOWN:
@@ -595,25 +740,78 @@ static void GX2SwapScanBuffers(CPUState* cpu) {
             // reuses its per-frame buffers (display lists, vertex and uniform
             // data) once it has swapped, and its GPU timestamps cannot see
             // work still queued here. Commands within the frame stay async.
+            const auto pres_start = std::chrono::steady_clock::now();
             const uint64_t posted = s_presents_posted.fetch_add(1) + 1;
             gx2_native_post(new Present(s_window, gamepad));
             Gx2PerfScope wait_scope(kPerfFrameWait);
             for (uint64_t done = s_presents_done.load(std::memory_order_acquire); done < posted;
                  done = s_presents_done.load(std::memory_order_acquire))
                 s_presents_done.wait(done, std::memory_order_acquire);
+            const float pres_dur = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - pres_start).count();
+            s_last_present_wait_ms.store(pres_dur, std::memory_order_relaxed);
         } else {
+            const auto pres_start = std::chrono::steady_clock::now();
             gx2_native_run(true, [&] { gx2_render_present(s_window, gamepad); });
+            const float pres_dur = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - pres_start).count();
+            s_last_present_wait_ms.store(pres_dur, std::memory_order_relaxed);
         }
     }
 #endif
     (void)cpu;
+    pace_flip();
     s_flip_count.store(s_swap_count.load());
     const uint64_t flip_tick = rbrew_system_ticks();
     s_last_flip.store(flip_tick);
+    const auto swap_end_tp = frame_clock::now();
+    // Completion-to-completion: the current present and preceding guest/vsync
+    // work belong to the same interval. The first sample has no predecessor.
+    const float frame_delta_ms = s_prev_swap_tp == frame_clock::time_point{} ? 0.0f :
+        float(std::chrono::duration<double, std::milli>(swap_end_tp - s_prev_swap_tp).count());
+    s_prev_swap_tp = swap_end_tp;
+    const float cpu_duration_ms = float(std::chrono::duration<double, std::milli>(frame_clock::now() - swap_start_tp).count());
+    const float vsync_wait_ms = s_last_vsync_wait_ms.exchange(0.0f, std::memory_order_relaxed);
+    const float present_wait_ms = s_last_present_wait_ms.exchange(0.0f, std::memory_order_relaxed);
+    const float guest_work_ms = std::max(0.0f, frame_delta_ms - (vsync_wait_ms + present_wait_ms));
+
+    SplatoonDiagnostics::RecordFrame(
+        uint32_t(s_swap_count.load()),
+        frame_delta_ms,
+        guest_work_ms,
+        present_wait_ms, vsync_wait_ms, cpu_duration_ms,
+        0, 0, 0,
+        uint8_t(g_screen_mode)
+    );
+
+    static FILE* benchmark_csv = [] {
+        const char* path = std::getenv("RBREW_BENCHMARK_CSV");
+        FILE* file = path && *path ? std::fopen(path, "w") : nullptr;
+        if (file) {
+            std::setvbuf(file, nullptr, _IOFBF, 65536);
+            std::fprintf(file, "Frame,Scene,FrameTime_ms,GuestWork_ms,VSyncWait_ms,PresentWait_ms,Capture,Profile\n");
+        }
+        return file;
+    }();
+    const uint32_t benchmark_frame = s_swap_count.load();
+    if (benchmark_csv) {
+        std::fprintf(benchmark_csv, "%u,%d,%.6f,%.6f,%.6f,%.6f,%u,%u\n", benchmark_frame,
+            rbrew_control_defaults::active_scene_type(MEM), frame_delta_ms, guest_work_ms,
+            vsync_wait_ms, present_wait_ms,
+            rbrew_benchmark::captured_frame.load(std::memory_order_relaxed) == benchmark_frame,
+            unsigned(rbrew_benchmark::profiling.load(std::memory_order_relaxed)));
+        if (benchmark_frame % 60 == 0) std::fflush(benchmark_csv);
+    }
+    static const bool frame_profile = std::getenv("RBREW_FRAME_PROFILE") != nullptr;
+    static uint32_t s_frame_profile_counter = 0;
+    if (++s_frame_profile_counter % 60 == 0 && frame_profile) {
+        std::fprintf(stderr, "[FRAME_PROFILE] Frame %5u: Delta=%.2fms (%.1f FPS) | GuestWork=%.2fms | VSyncWait=%.2fms | PresentWait=%.2fms | SwapProc=%.2fms\n",
+                     s_frame_profile_counter, frame_delta_ms, (frame_delta_ms > 0.01f ? 1000.0f / frame_delta_ms : 0.0f),
+                     guest_work_ms, vsync_wait_ms, present_wait_ms, cpu_duration_ms);
+        std::fflush(stderr);
+    }
 #if defined(HAVE_SDL2)
     if (s_window) {
         if (!s_fps_sample_tick) { s_fps_sample_tick = flip_tick; s_fps_frames = 0; }
-        else if (++s_fps_frames; flip_tick - s_fps_sample_tick >= RBREW_TIMER_CLOCK) {
+        else if (++s_fps_frames; flip_tick - s_fps_sample_tick >= (RBREW_TIMER_CLOCK / 4)) {   // 4 Hz: SetWindowTitle is not free
             s_window_fps = double(s_fps_frames) * RBREW_TIMER_CLOCK / double(flip_tick - s_fps_sample_tick);
             s_fps_sample_tick = flip_tick; s_fps_frames = 0;
             update_window_title();
@@ -692,6 +890,7 @@ void gx2_context_register(CPUState* cpu) {
     REG(GX2Flush);
     REG(GX2WaitForVsync);
     REG(GX2GetSwapStatus);
+    REG(GX2SetSwapInterval);
     REG(GX2CopyColorBufferToScanBuffer);
     REG(GX2SwapScanBuffers);
     REG(GX2SetTVEnable);

@@ -277,10 +277,15 @@ static int overlay_present_test() {
     if(!presented){gx2vk::capture_presents(false);gx2vk::destroy_image(frame);gx2vk::shutdown();SDL_DestroyWindow(window);SDL_Quit();return 77;}
     require(gx2vk::finish(),"overlay presents did not complete");
     std::vector<uint8_t> rgba;uint32_t w=0,h=0;require(gx2vk::last_present(rgba,w,h) && w && h,"overlay present readback missing");
-    // Strip: from (2*scale, 2*scale), width/height from the text actually shown.
+    // Translucent panel at the top-left corner (margin >= 8 px): it darkens the
+    // authored frame (64,128,191) but keeps its blue showing through, and has
+    // light anti-aliased text. The classic 5x7 line
+    // (RBREW_FPS_OVERLAY_STYLE=classic) is pure white on black.
     const unsigned scale=(std::max)(2u,h/360);unsigned white=0,black=0;
-    for(unsigned y=2*scale;y<2*scale+11*scale && y<h;++y)for(unsigned x=2*scale;x<w/2;++x){const uint8_t* p=&rgba[(size_t(y)*w+x)*4];
-        white+=p[0]==255&&p[1]==255&&p[2]==255;black+=p[0]==0&&p[1]==0&&p[2]==0;}
+    for(unsigned y=4;y<(std::min)(h,90u);++y)for(unsigned x=4;x<w/2;++x){const uint8_t* p=&rgba[(size_t(y)*w+x)*4];
+        const bool glass=p[2]<150 && p[2]>p[0]+20 && p[0]<60;   // darkened, still bluish
+        const bool classic_black=p[0]==0&&p[1]==0&&p[2]==0;
+        black+=glass||classic_black;white+=p[0]>=180&&p[1]>=180&&p[2]>=180;}
     const uint8_t* away=&rgba[(size_t(h-4)*w+w-4)*4];
     require(white>40*scale*scale && black>white,"FPS overlay text did not reach the presented image");
     if(const char* dump=std::getenv("RBREW_OVERLAY_DUMP"))if(FILE* f=std::fopen(dump,"wb")){std::fwrite(&w,4,1,f);std::fwrite(&h,4,1,f);std::fwrite(rgba.data(),1,rgba.size(),f);std::fclose(f);}

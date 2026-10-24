@@ -46,10 +46,10 @@ inline uint32_t checksum(std::span<const uint8_t> bytes) {
 // retain their original bytes.
 inline bool patch_image(std::span<uint8_t> image) {
     if (image.size() != kSaveSize || be32(image.data() + 4) != 6) return false;
-    if (be32(image.data() + kSensitivity) == kSensitivityBits && image[kMotion] == 0) return false;
+    if (be32(image.data() + kSensitivity) == kSensitivityBits) return false;
     if (be32(image.data() + kChecksum) != checksum(image.subspan(kPayload))) return false;
     put_be32(image.data() + kSensitivity, kSensitivityBits);
-    image[kMotion] = 0;
+    // Preserve user motion preference: do not overwrite image[kMotion]
     put_be32(image.data() + kChecksum, checksum(image.subspan(kPayload)));
     return true;
 }
@@ -126,32 +126,47 @@ inline void apply_live(uint8_t* mem) {
     if (!mem) return;
     // Original 020355C0 copies the eight-byte GamePad option into +0x17C.
     // Change only its float and gyro byte, preserving both reverse settings.
-    // The tutorial locks stick aiming, so retain its original motion mode:
+    // The tutorial locks stick aiming, so it keeps its original motion mode:
     // the existing VPAD code supplies that motion from the right stick/mouse.
-    // Other active scenes, including Plaza, use the requested saved settings.
     const int scene_type = active_scene_type(mem);
+    if (scene_type < 0) return;   // scene initialization/teardown in progress
     const bool tutorial = scene_type == 5 || scene_type == 6;
-    const uint32_t sensitivity = tutorial ? kTutorialSensitivityBits : kSensitivityBits;
-    const uint8_t motion = tutorial ? 1 : 0;
-    constexpr uint32_t kControlManager = 0x101C1D34u;
-    const uint32_t manager = rbrew_read32(mem, kControlManager);
-    if (scene_type >= 0 && manager && uint64_t(manager) + 0x184 <= WIIU_MEM_SIZE &&
-        rbrew_memory_accessible(mem, manager + 0x17C, 8)) {
-        if (rbrew_read32(mem, manager + 0x17C) != sensitivity)
-            rbrew_write32(mem, manager + 0x17C, sensitivity);
-        if (mem[manager + 0x182] != motion) rbrew_write8(mem, manager + 0x182, motion);
-    }
+
     // 021729AC -> 02173470 -> 02172AD8 proves that the saved options are
-    // at *(save_manager + 0xC) + 0x14. Keep that cached save image in sync
-    // too. Save motion off/0.0 even during the temporary tutorial override;
-    // only the active GamePad options use the tutorial's original defaults.
+    // at *(save_manager + 0xC) + 0x14. Keep that cached save image at
+    // neutral sensitivity; the player's motion choice is preserved.
+    const uint8_t* saved = nullptr;
     constexpr uint32_t kSaveManager = 0x101C9564u;
     const uint32_t save_manager = rbrew_read32(mem, kSaveManager);
-    if (!save_manager || uint64_t(save_manager) + 0x10 > WIIU_MEM_SIZE ||
-        !rbrew_memory_accessible(mem, save_manager + 0x0C, 4)) return;
-    const uint32_t image = rbrew_read32(mem, save_manager + 0x0C);
-    if (image && uint64_t(image) + kSaveSize <= WIIU_MEM_SIZE &&
-        rbrew_memory_accessible(mem, image, kSaveSize))
-        patch_image(std::span<uint8_t>(mem + image, kSaveSize));
+    if (save_manager && uint64_t(save_manager) + 0x10 <= WIIU_MEM_SIZE &&
+        rbrew_memory_accessible(mem, save_manager + 0x0C, 4)) {
+        const uint32_t image = rbrew_read32(mem, save_manager + 0x0C);
+        if (image && uint64_t(image) + kSaveSize <= WIIU_MEM_SIZE &&
+            rbrew_memory_accessible(mem, image, kSaveSize)) {
+            patch_image(std::span<uint8_t>(mem + image, kSaveSize));
+            if (be32(mem + image + 4) == 6) saved = mem + image;   // verified format only
+        }
+    }
+
+    constexpr uint32_t kControlManager = 0x101C1D34u;
+    const uint32_t manager = rbrew_read32(mem, kControlManager);
+    if (!manager || uint64_t(manager) + 0x184 > WIIU_MEM_SIZE ||
+        !rbrew_memory_accessible(mem, manager + 0x17C, 8)) return;
+    uint32_t sensitivity;
+    uint8_t motion;
+    if (tutorial) {
+        // The tutorial requires motion aiming to progress.
+        sensitivity = kTutorialSensitivityBits;
+        motion = 1;
+    } else if (saved) {
+        // Outside the tutorial use the player's saved options. Without this
+        // the tutorial override (motion on, -0.2) stayed active afterwards.
+        sensitivity = be32(saved + kSensitivity);
+        motion = saved[kMotion];
+    } else {
+        return;
+    }
+    if (rbrew_read32(mem, manager + 0x17C) != sensitivity) rbrew_write32(mem, manager + 0x17C, sensitivity);
+    if (mem[manager + 0x182] != motion) rbrew_write8(mem, manager + 0x182, motion);
 }
 } // namespace rbrew_control_defaults

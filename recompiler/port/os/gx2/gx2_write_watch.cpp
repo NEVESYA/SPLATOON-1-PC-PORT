@@ -42,10 +42,10 @@ uint32_t s_epoch = 1;
 thread_local bool t_epoch_reuse = false;
 thread_local const uint8_t* t_observed_mem = nullptr;
 
-// Diagnostic copies only: RBREW_WRITE_WATCH_DISABLE=1 reports every range
-// untracked, so all geometry/uniform caches re-read guest memory each use.
+// RBREW_WRITE_WATCH_DISABLE=1 reports every range untracked, so all
+// geometry/uniform caches re-read guest memory each use (slow; for A/B tests).
 bool tracking_disabled() {
-    static const bool disabled = [] { const char* v = rbrew_diagnostic_env("RBREW_WRITE_WATCH_DISABLE"); return v && v[0] == '1'; }();
+    static const bool disabled = [] { const char* v = std::getenv("RBREW_WRITE_WATCH_DISABLE"); return v && v[0] == '1'; }();
     return disabled;
 }
 bool reuse_enabled() {

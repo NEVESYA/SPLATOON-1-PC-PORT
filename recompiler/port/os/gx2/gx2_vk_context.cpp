@@ -53,6 +53,7 @@ struct Item {
 std::mutex s_queue_mutex;
 std::vector<Item> s_queue;
 size_t s_queue_size = 0;                     // guarded by s_queue_mutex
+bool s_executing = false;                   // guarded by s_queue_mutex
 uint32_t s_next_ticket = 0;                  // guarded by s_queue_mutex
 std::atomic<uint32_t> s_pushed{0}, s_done{0};
 std::atomic<bool> s_sleeping{false};
@@ -118,6 +119,7 @@ void render_thread() {
         {
             std::lock_guard lock(s_queue_mutex);
             batch.swap(s_queue);
+            s_executing = !batch.empty();
             s_queue_size = 0;
             // Observe publication while checking the queue. A producer that
             // posts after this empty check must change this counter; taking
@@ -139,6 +141,7 @@ void render_thread() {
                 else _mm_pause();
             }
             if (!queued) {
+                gx2_render_query_poll();
                 s_sleeping.store(true, std::memory_order_seq_cst);
                 if (s_pushed.load(std::memory_order_seq_cst) == seen) s_pushed.wait(seen, std::memory_order_acquire);
                 s_sleeping.store(false, std::memory_order_relaxed);
@@ -167,6 +170,7 @@ void render_thread() {
         }
         busy.stop();
         batch.clear();
+        gx2_render_query_poll();
     }
     s_running.store(false,std::memory_order_release);
     s_running.notify_all();
@@ -238,6 +242,11 @@ void gx2_native_execute(bool gpu, Gx2Task task, void* context) {
 
 bool gx2_native_async_active() {
     return !t_render_thread && s_running.load(std::memory_order_acquire) && async_enabled();
+}
+
+bool gx2_native_queue_idle() {
+    std::lock_guard lock(s_queue_mutex);
+    return s_queue.empty() && !s_executing;
 }
 
 void gx2_native_post(Gx2AsyncWork* work) {

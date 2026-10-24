@@ -171,6 +171,7 @@ static void FSOpenFile(CPUState* cpu) {
         return;
     }
     FILE* f = fopen(host, "rb");
+    if (f) setvbuf(f, nullptr, _IOFBF, 64 * 1024);
     TXDIAG(txdiag::event("asset_open","\"path\":%s,\"ok\":%s,\"lr\":%u",txdiag::quote(gpath).c_str(),f?"true":"false",cpu->lr));
     if (!f) {
         RBREW_LOGF(stderr, "[FS] FSOpenFile failed: %s (errno=%d)\n", host, errno);

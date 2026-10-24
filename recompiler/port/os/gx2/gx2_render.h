@@ -221,7 +221,9 @@ bool gx2_render_query_result(uint32_t address,uint32_t output,uint8_t* mem);
 // Occlusion fast-path bookkeeping (gx2_draw.cpp), called by the renderer when
 // a query begin executes and when its counters reach guest memory.
 void gx2_query_render_begin(uint32_t address);
+void gx2_query_render_end(uint32_t address, uint64_t serial);
 void gx2_query_render_published(uint32_t address);
+uint64_t gx2_render_completed_serial();
 void gx2_render_query_poll();
 void gx2_render_conditional_begin(uint32_t type,uint32_t address,bool no_wait,bool pixels_pass,uint8_t* mem);
 void gx2_render_conditional_end();

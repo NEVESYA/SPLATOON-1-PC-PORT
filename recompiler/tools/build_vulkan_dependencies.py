@@ -5,8 +5,10 @@ Original inputs are never modified. No game execution is involved.
 """
 from pathlib import Path
 import argparse
+import concurrent.futures
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tarfile
@@ -63,16 +65,44 @@ def prepare(args):
     stamp.write_text(json.dumps(dict(profile=1, compiler_sha512=GLSLANG_SHA512)), encoding='utf-8')
     return sdl, compiler
 
+def build_profile(source, name, options, common, args, parallel_jobs):
+    build, prefix = args.build_root.resolve() / (name + '-build'), args.prefix.resolve() / name
+    marker = prefix / ('cmake/SDL2VulkanOnly.cmake' if name == 'sdl2-vulkan' else 'lib/cmake/glslang/GlslangVulkanOnly.cmake')
+    if marker.exists():
+        return
+    subprocess.run([args.cmake, '-S', str(source), '-B', str(build), *common, *options,
+        '-DCMAKE_INSTALL_PREFIX=' + str(prefix)], check=True)
+    subprocess.run([args.cmake, '--build', str(build), '--config', 'Release', '--target', 'install', '--parallel', str(parallel_jobs)], check=True)
+    marker.write_text('# Audited Vulkan dependency profile 1.\n', encoding='utf-8')
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--sdl-source', type=Path, required=True)
     parser.add_argument('--glslang-archive', type=Path, required=True)
     parser.add_argument('--build-root', type=Path, required=True)
     parser.add_argument('--prefix', type=Path, required=True)
+    parser.add_argument('--cache-dir', type=Path, default=None)
     parser.add_argument('--prepare-only', action='store_true')
     parser.add_argument('--generator', default='Visual Studio 18 2026', help='CMake Visual Studio generator')
     parser.add_argument('--cmake', default='cmake', help='cmake executable')
     args = parser.parse_args()
+
+    # Check cache first
+    if args.cache_dir:
+        cache_root = args.cache_dir.resolve()
+        sdl_cached = cache_root / 'sdl2-vulkan'
+        glslang_cached = cache_root / 'glslang-vulkan'
+        sdl_m = sdl_cached / 'cmake/SDL2VulkanOnly.cmake'
+        glslang_m = glslang_cached / 'lib/cmake/glslang/GlslangVulkanOnly.cmake'
+        if sdl_m.exists() and glslang_m.exists():
+            prefix_sdl = args.prefix.resolve() / 'sdl2-vulkan'
+            prefix_glslang = args.prefix.resolve() / 'glslang-vulkan'
+            if not prefix_sdl.exists():
+                shutil.copytree(sdl_cached, prefix_sdl)
+            if not prefix_glslang.exists():
+                shutil.copytree(glslang_cached, prefix_glslang)
+            return
+
     sdl, compiler = prepare(args)
     if args.prepare_only:
         return
@@ -84,13 +114,26 @@ def main():
         (compiler, 'glslang-vulkan', ['-DBUILD_EXTERNAL=OFF', '-DBUILD_SHARED_LIBS=OFF', '-DGLSLANG_TESTS=OFF',
             '-DENABLE_GLSLANG_BINARIES=OFF', '-DENABLE_HLSL=OFF', '-DENABLE_OPT=OFF', '-DENABLE_RTTI=OFF',
             '-DGLSLANG_ENABLE_INSTALL=ON'])]
-    for source, name, options in profiles:
-        build, prefix = args.build_root.resolve() / (name + '-build'), args.prefix.resolve() / name
-        subprocess.run([args.cmake, '-S', str(source), '-B', str(build), *common, *options,
-            '-DCMAKE_INSTALL_PREFIX=' + str(prefix)], check=True)
-        subprocess.run([args.cmake, '--build', str(build), '--config', 'Release', '--target', 'install', '--parallel', '4'], check=True)
-        marker = prefix / ('cmake/SDL2VulkanOnly.cmake' if name == 'sdl2-vulkan' else 'lib/cmake/glslang/GlslangVulkanOnly.cmake')
-        marker.write_text('# Audited Vulkan dependency profile 1.\n', encoding='utf-8')
+
+    parallel_jobs = max(4, os.cpu_count() or 4)
+    # Build both dependencies concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(build_profile, source, name, options, common, args, parallel_jobs)
+            for source, name, options in profiles
+        ]
+        for f in concurrent.futures.as_completed(futures):
+            f.result()
+
+    # Update cache if enabled
+    if args.cache_dir:
+        cache_root = args.cache_dir.resolve()
+        cache_root.mkdir(parents=True, exist_ok=True)
+        for name in ('sdl2-vulkan', 'glslang-vulkan'):
+            src = args.prefix.resolve() / name
+            dst = cache_root / name
+            if src.exists() and not dst.exists():
+                shutil.copytree(src, dst)
 
 if __name__ == '__main__':
     main()

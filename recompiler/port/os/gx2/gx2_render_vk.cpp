@@ -1,4 +1,5 @@
 #include "../../runtime/rbrew_diagnostics.h"
+#include "../../runtime/benchmark_input.h"
 #include "gx2_texture_diagnostics.h"
 // gx2_render_vk.cpp - Vulkan back-end for GX2 (render targets, textures,
 // samplers, raster state, surface copies, scan buffers, presentation).
@@ -317,9 +318,21 @@ static uint32_t gx2_blend_factor(uint32_t m) {
     default: return wire::ONE;
     }
 }
+// GX2BlendCombine / CB_BLENDn_CONTROL COMB_FCN: 0 dst+src, 1 src-dst,
+// 2 min, 3 max, 4 dst-src (as Cemu and decaf map them). The port had 2/3/4 as
+// dst-src/min/max, so MAX blends ran as MIN: Splatoon's button-label capture
+// (alpha MAX into a cleared target) stayed alpha 0 and the labels vanished.
+// RBREW_BLEND_COMBINE_OLD=1 restores the old mapping.
 static uint32_t gx2_blend_equation(uint32_t c) {
+    static const bool old = [] { const char* v = std::getenv("RBREW_BLEND_COMBINE_OLD"); return v && v[0] == '1'; }();
+    if (old) {
+        switch (c) {
+        case 1: return wire::FUNC_SUBTRACT; case 2: return wire::FUNC_REVERSE_SUBTRACT; case 3: return wire::MIN; case 4: return wire::MAX;
+        default: return wire::FUNC_ADD;
+        }
+    }
     switch (c) {
-    case 1: return wire::FUNC_SUBTRACT; case 2: return wire::FUNC_REVERSE_SUBTRACT; case 3: return wire::MIN; case 4: return wire::MAX;
+    case 1: return wire::FUNC_SUBTRACT; case 2: return wire::MIN; case 3: return wire::MAX; case 4: return wire::FUNC_REVERSE_SUBTRACT;
     default: return wire::FUNC_ADD;
     }
 }
@@ -431,14 +444,41 @@ void gx2_render_init() {
     S.raster.front_face = wire::CCW;
     // Select physical desktop pixels once, before creating any guest targets.
     // Resizing a window must not silently change the scene's render resolution.
+    // RBREW_RENDER_RESOLUTION allows diagnostic comparison (720p / 1080p / 1440p / native).
     if (auto* window = static_cast<SDL_Window*>(gx2_native_window())) {
         SDL_DisplayMode desktop{};
         const int display = SDL_GetWindowDisplayIndex(window);
-        if (display < 0 || SDL_GetDesktopDisplayMode(display, &desktop) != 0 ||
-            !gx2_render_set_display_resolution(uint32_t(std::max(0, desktop.w)), uint32_t(std::max(0, desktop.h)))) {
-            RBREW_LOGF(stderr, "[gx2_render] cannot select the desktop's render resolution\n");
+        if (display < 0 || SDL_GetDesktopDisplayMode(display, &desktop) != 0) {
+            RBREW_LOGF(stderr, "[gx2_render] cannot query the desktop's display mode\n");
             std::exit(3);
         }
+        // Console-native scene workload; the window still fills the desktop.
+        // Higher internal resolutions remain available through the override.
+        uint32_t target_w = 1280;
+        uint32_t target_h = 720;
+        if (const char* res_override = std::getenv("RBREW_RENDER_RESOLUTION")) {
+            if (std::strcmp(res_override, "720p") == 0 || std::strcmp(res_override, "1280x720") == 0) {
+                target_w = 1280; target_h = 720;
+            } else if (std::strcmp(res_override, "1080p") == 0 || std::strcmp(res_override, "1920x1080") == 0) {
+                target_w = 1920; target_h = 1080;
+            } else if (std::strcmp(res_override, "1440p") == 0 || std::strcmp(res_override, "2560x1440") == 0) {
+                target_w = 2560; target_h = 1440;
+            } else if (std::strcmp(res_override, "native") == 0) {
+                target_w = uint32_t(std::max(0, desktop.w));
+                target_h = uint32_t(std::max(0, desktop.h));
+            } else {
+                uint32_t parsed_w = 0, parsed_h = 0;
+                if (std::sscanf(res_override, "%ux%u", &parsed_w, &parsed_h) == 2 && parsed_w > 0 && parsed_h > 0) {
+                    target_w = parsed_w; target_h = parsed_h;
+                }
+            }
+        }
+        if (!gx2_render_set_display_resolution(target_w, target_h)) {
+            RBREW_LOGF(stderr, "[gx2_render] cannot select the render resolution (%ux%u)\n", target_w, target_h);
+            std::exit(3);
+        }
+        RBREW_LOGF(stderr, "[gx2_render] Internal render resolution: %ux%u (desktop display: %dx%d)\n",
+                   target_w, target_h, desktop.w, desktop.h);
         S.raster.viewport[2] = 1280; S.raster.viewport[3] = 720;
     }
     RBREW_LOGF(stderr, "[gx2_render] Vulkan rendering back-end initialised (%s)\n", gx2vk::caps().device_name.c_str());
@@ -615,6 +655,7 @@ void gx2_render_set_color_buffer(uint32_t cb_addr, uint8_t* mem, const uint8_t* 
         e.tex.id = e.id;
         e.tex.coordinate_scale = image_coordinate_scale(e.image, w, h);
         it = S.cb_map.emplace(key, std::move(e)).first;
+        ++S.color_view_revision;
         it->second.tex.image = &it->second.image;
         RBREW_LOGF(stderr, "[gx2_render] created FBO %u for CB 0x%08X (%ux%u fmt=0x%04X)\n", it->second.id, cb_addr, w, h, fmt);
         // A surface used both as a depth buffer and as a color target is how
@@ -635,6 +676,7 @@ void gx2_render_set_depth_buffer(uint32_t db_addr, uint8_t* mem, const uint8_t* 
     const auto* data = descriptor ? descriptor : mem + db_addr;
     const auto key = color_image_key(db_addr, mem, data);
     auto [it, inserted] = S.depth_map.try_emplace(key);
+    if (inserted) ++S.depth_view_revision;
     auto& e = it->second;
     if (inserted) {
         const uint32_t mip = key[5];
@@ -654,7 +696,7 @@ void gx2_render_set_depth_buffer(uint32_t db_addr, uint8_t* mem, const uint8_t* 
         desc.width = extent.width; desc.height = extent.height;
         desc.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (!gx2vk::create_image(e.image, desc)) { S.depth_map.erase(it); return; }
+        if (!gx2vk::create_image(e.image, desc)) { S.depth_map.erase(it); ++S.depth_view_revision; return; }
         clear_image_depth(e.image, 0.0f, 0);
         e.tex.image = &e.image;
         e.tex.target = wire::TEXTURE_2D;
@@ -948,9 +990,10 @@ void gx2_render_set_polygon_control(uint32_t front_face, bool cull_front, bool c
 
 void gx2r::apply_native_raster_registers(const Gx2RegisterWrite* writes, size_t count) {
     bool mask = false, blend = false, alpha = false, point = false, restart = false, viewport = false, scissor = false,
-         stencil = false, polygon = false, offset = false;
+         stencil = false, polygon = false, offset = false, blend_control = false, color_control = false;
     for (size_t i = 0; i < count; ++i) {
         const uint32_t r = writes[i].index;
+        blend_control |= r == 0xA1E0; color_control |= r == 0xA202;
         mask |= r == 0xA08E; blend |= r >= 0xA105 && r <= 0xA108; alpha |= r == 0xA351; point |= r == 0xA280;
         restart |= r == 0xA103 || r == 0xA2A5; viewport |= r == 0xA204 || (r >= 0xA10F && r <= 0xA114); scissor |= r == 0xA090 || r == 0xA091;
         stencil |= r == 0xA200 || r == 0xA10C || r == 0xA10D; polygon |= r == 0xA205; offset |= r >= 0xA37F && r <= 0xA383;
@@ -958,6 +1001,27 @@ void gx2r::apply_native_raster_registers(const Gx2RegisterWrite* writes, size_t 
     auto f = [](uint32_t r) { float v; const uint32_t w = S.regs[r]; std::memcpy(&v, &w, 4); return v; };
     if (mask) gx2_render_set_target_channel_masks(S.regs[0xA08E]);
     if (blend) S.raster.blend_color = {f(0xA105), f(0xA106), f(0xA107), f(0xA108)};
+    // CB_BLEND0_CONTROL / CB_COLOR_CONTROL written by display lists (layout
+    // materials build theirs this way). They were ignored, so UI text kept
+    // the previous material's blend: barely visible on the TV, but text
+    // rendered into an offscreen capture (Splatoon's button labels) got alpha
+    // 0 and the labels vanished. RBREW_DL_BLEND=0 ignores them again.
+    static const bool dl_blend = [] { const char* v = std::getenv("RBREW_DL_BLEND"); return !(v && v[0] == '0'); }();
+    if ((blend_control || color_control) && dl_blend) {
+        const uint32_t color = S.regs[0xA202], w = S.regs[0xA1E0];
+        // Without a CB_COLOR_CONTROL write the enable stays; without a
+        // CB_BLEND0_CONTROL write the factors stay.
+        const bool enable = color_control ? ((color >> 8) & 1) != 0 : S.raster.blend;
+        if (blend_control) {
+            const bool separate = (w >> 29) & 1;
+            const uint32_t src = w & 0x1F, dst = (w >> 8) & 0x1F, combine = (w >> 5) & 7;
+            gx2_render_set_blend_control(true, src, dst, combine,
+                                         separate ? (w >> 16) & 0x1F : src, separate ? (w >> 24) & 0x1F : dst,
+                                         separate ? (w >> 21) & 7 : combine);
+        }
+        S.raster.blend = enable;
+        if (color_control) gx2_render_set_color_write(((color >> 4) & 7) != 1);
+    }
     if (alpha) S.raster.alpha_to_coverage = (S.regs[0xA351] & 1) != 0;
     if (point) S.raster.point_size = std::max(0.125f, float(S.regs[0xA280] >> 16) / 8);
     if (restart) { S.raster.restart_index = S.regs[0xA103]; S.raster.primitive_restart = (S.regs[0xA2A5] & 1) != 0; }
@@ -1212,10 +1276,14 @@ static bool copy_color_view(ColorTarget& source, gx2vk::Image& destination, cons
     return true;
 }
 
+void gx2r_streamout_flush_if_overlaps(uint8_t* mem, uint32_t address, uint64_t size);   // gx2_render_vk_draw.cpp
 void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, const uint8_t* descriptor) {
     Gx2PerfScope perf_scope(kPerfTexture);
     if (!tex_addr || !gx2vk::ready() || slot >= S.bound_textures.size()) return;
     const auto* data = descriptor ? descriptor : mem + tex_addr;
+    // A texture over a pending stream-out export needs its results first.
+    gx2r_streamout_flush_if_overlaps(mem, descriptor_word(data, GX2SURF_IMAGE), descriptor_word(data, GX2SURF_IMAGE_SIZE));
+    gx2r_streamout_flush_if_overlaps(mem, descriptor_word(data, GX2SURF_MIPMAPS), descriptor_word(data, GX2SURF_MIPMAP_SIZE));
     TXDIAG(txdiag::count(txdiag::Lookups));
 #ifdef RBREW_TEXTURE_DIAGNOSTICS
     txdiag::TextureScope diagnostic_scope{mem,data,tex_addr,slot};
@@ -1265,7 +1333,15 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
     entry.created = true;
     entry.tex.target = target;
 
-    for (auto& [key, depth] : image_views(S.depth_map, img_ptr)) {
+    if (entry.depth_revision != S.depth_view_revision) {
+        entry.depth_candidates.clear();
+        if (target == wire::TEXTURE_2D || (target == wire::TEXTURE_2D_ARRAY && layers == 1))
+            for (const auto& candidate : image_views(S.depth_map, img_ptr))
+                if (texture_view_matches(candidate.first, data)) entry.depth_candidates.push_back(&candidate);
+        entry.depth_revision = S.depth_view_revision;
+    }
+    for (const auto* candidate : entry.depth_candidates) {
+        const auto& [key, depth] = *candidate;
         ++C.alias_probes;
         static const bool depth_alias_probe = rbrew_diagnostic_env("RBREW_DEPTH_ALIAS_PROBE") != nullptr;  // read once: per-draw path
         if (depth_alias_probe) {
@@ -1365,10 +1441,27 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
     }
     // Render-to-texture: a texture over a color buffer's image reads what the
     // GPU drew there, which lives only in the native image.
-    for (auto& [key, cbc] : image_views(S.cb_map, img_ptr)) {
+    const auto compressed = gx2_vk_format(fmt);
+    const bool dest32 = fmt == 0x122u || fmt == 0x322u || fmt == 0x823u;
+    if (entry.color_revision != S.color_view_revision) {
+        entry.color_candidates.clear();
+        if (target == wire::TEXTURE_2D) for (const auto& candidate : image_views(S.cb_map, img_ptr)) {
+            const auto& [key, cb] = candidate;
+            const bool source32 = key[1] == 0x122u || key[1] == 0x322u || key[1] == 0x823u;
+            const bool blocks = compressed.compressed && compressed.block == 16 &&
+                (key[1] == 0x122u || key[1] == 0x322u) && cb.width == (w + 3) / 4 && cb.height == (h + 3) / 4 &&
+                key[4] == descriptor_word(data, GX2SURF_PITCH) && key[5] == descriptor_word(data, GX2TEX_VIEW_MIP) &&
+                key[6] == first_slice && key[8] == descriptor_word(data, GX2SURF_AA);
+            if (blocks || texture_view_matches(key, data) ||
+                (source32 && dest32 && texture_view_matches(key, data, true)))
+                entry.color_candidates.push_back(&candidate);
+        }
+        entry.color_revision = S.color_view_revision;
+    }
+    for (const auto* candidate : entry.color_candidates) {
+        const auto& [key, cbc] = *candidate;
         auto& cb = const_cast<ColorTarget&>(cbc);
         ++C.alias_probes;
-        const auto compressed = gx2_vk_format(fmt);
         if (target == wire::TEXTURE_2D && compressed.compressed && compressed.block == 16 &&
             (key[1] == 0x122u || key[1] == 0x322u) && key[0] == img_ptr && cb.width == (w + 3) / 4 && cb.height == (h + 3) / 4 &&
             key[4] == descriptor_word(data, GX2SURF_PITCH) && key[5] == descriptor_word(data, GX2TEX_VIEW_MIP) &&
@@ -1380,11 +1473,47 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
                 end_rendering();
                 VkCommandBuffer cbuf = gx2vk::cmd();
                 gx2vk::barrier_if_dirty();
+                // An image-to-image copy covers whole blocks (cb.width * 4
+                // texels), which overruns a texture whose size is not a
+                // multiple of 4 (Splatoon's 250x150 button labels): invalid in
+                // Vulkan, and the driver dropped it, leaving the labels blank.
+                // A buffer copy may end in partial edge blocks.
+                // RBREW_BLOCK_COPY_DIRECT=1 restores the image-to-image copy.
+                static const bool direct = [] { const char* v = std::getenv("RBREW_BLOCK_COPY_DIRECT"); return v && v[0] == '1'; }();
+                if (!direct && (w % 4 || h % 4)) {
+                    static gx2vk::Buffer s_block_staging;
+                    const VkDeviceSize bytes = VkDeviceSize(cb.width) * cb.height * 16;
+                    if (s_block_staging.size < bytes) {
+                        gx2vk::destroy_buffer(s_block_staging);
+                        s_block_staging = gx2vk::create_buffer(std::max<VkDeviceSize>(bytes, 1 << 16),
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, gx2vk::MemoryUse::DeviceLocal);
+                    }
+                    if (s_block_staging.buffer) {
+                        VkBufferImageCopy out{};
+                        out.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                        out.imageExtent = {cb.width, cb.height, 1};
+                        vkCmdCopyImageToBuffer(cbuf, cb.image.image, VK_IMAGE_LAYOUT_GENERAL, s_block_staging.buffer, 1, &out);
+                        VkMemoryBarrier2 between{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+                        between.srcStageMask = between.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+                        between.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                        between.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                        VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                        dependency.memoryBarrierCount = 1; dependency.pMemoryBarriers = &between;
+                        vkCmdPipelineBarrier2(cbuf, &dependency);
+                        VkBufferImageCopy in{};
+                        in.bufferRowLength = cb.width * 4; in.bufferImageHeight = cb.height * 4;   // texels, whole blocks
+                        in.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                        in.imageExtent = {w, h, 1};   // ends at the image edge: partial blocks allowed
+                        vkCmdCopyBufferToImage(cbuf, s_block_staging.buffer, entry.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
+                        gx2vk::note_gpu_write(entry.image);
+                    }
+                } else {
                 VkImageCopy region{};
                 region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 region.extent = {cb.width, cb.height, 1};
                 vkCmdCopyImage(cbuf, cb.image.image, VK_IMAGE_LAYOUT_GENERAL, entry.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                }
                 live_copy_recorded(entry, cb);
                 entry.tex.view_format = compressed.format; entry.tex.levels = 1; entry.tex.layers = 1;
                 entry.tex.compressed = true; entry.tex.integer = false; entry.tex.depth = false; entry.tex.complete_storage = true;
@@ -1406,7 +1535,6 @@ void gx2_render_upload_texture(uint32_t tex_addr, uint32_t slot, uint8_t* mem, c
             return;
         }
         const bool source32 = key[1] == 0x122u || key[1] == 0x322u || key[1] == 0x823u;
-        const bool dest32 = fmt == 0x122u || fmt == 0x322u || fmt == 0x823u;
         if (target == wire::TEXTURE_2D && source32 && dest32 && texture_view_matches(key, data, true)) {
             // glTextureView reinterpretation of the target's 128-bit texels.
             auto& view = S.color_views[{cb.id, fmt, word4}];
@@ -1883,7 +2011,17 @@ struct EncodedScan { gx2vk::Image srgb, raw; uint32_t width = 0, height = 0; };
 EncodedScan s_encoded[2];
 std::string s_pending_present_capture;
 gx2vk::Image s_present_raw;   // UNORM copy of an sRGB-format scan source
+// The console's scan buffer is a copy that keeps showing the last copied
+// frame. Presenting the game's colour buffer itself showed whatever it held
+// at present time: on scene changes the game skips copies and clears or
+// reuses that buffer, which flashed black. RBREW_SCAN_COPY=0 restores the
+// direct reference.
+gx2vk::Image s_scan_copy[2];
 unsigned s_draws_requested_report = 0;
+bool scan_copy_enabled() {
+    static const bool on = [] { const char* v = std::getenv("RBREW_SCAN_COPY"); return !(v && v[0] == '0'); }();
+    return on;
+}
 }
 void gx2r_shutdown_scan_images() {
     s_pending_present_capture.clear();
@@ -1891,6 +2029,7 @@ void gx2r_shutdown_scan_images() {
         gx2vk::destroy_image(encoded.srgb); gx2vk::destroy_image(encoded.raw);
         encoded = {};
     }
+    for (auto& copy : s_scan_copy) gx2vk::destroy_image(copy);
     gx2vk::destroy_image(s_present_raw);
 }
 void gx2r::capture_next_present(const std::string& path) { s_pending_present_capture = path; }
@@ -1916,6 +2055,20 @@ void gx2_render_copy_to_scan(uint32_t cb_addr, uint32_t scan_target, uint8_t* me
     }
     const auto scan_key = color_image_key(cb_addr, mem, descriptor);
     auto it = S.cb_map.find(scan_key);
+    // Splatoon passes its GamePad (DRC) buffer with viewNumSlices 0 while it
+    // renders through the same buffer with 1, so the exact key never matched:
+    // no GamePad image ever reached the scan buffer (tutorial GamePad picture,
+    // map, menu labels shown there). 0 and 1 slices name the same single
+    // slice. RBREW_SCAN_SLICE_MATCH=0 restores the exact lookup only.
+    static const bool slice_match = [] { const char* v = std::getenv("RBREW_SCAN_SLICE_MATCH"); return !(v && v[0] == '0'); }();
+    if (it == S.cb_map.end() && slice_match && scan_key[7] <= 1) {
+        for (auto candidate = S.cb_map.begin(); candidate != S.cb_map.end(); ++candidate) {
+            ColorImageKey key = candidate->first;
+            if (key[7] > 1) continue;
+            key[7] = scan_key[7];
+            if (key == scan_key) { it = candidate; break; }
+        }
+    }
     if (it == S.cb_map.end()) {
         static unsigned misses = 0;
         if (misses++ < 20)
@@ -1961,6 +2114,26 @@ void gx2_render_copy_to_scan(uint32_t cb_addr, uint32_t scan_target, uint8_t* me
         vkCmdCopyImage(cb, encoded.srgb.image, VK_IMAGE_LAYOUT_GENERAL, encoded.raw.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
         gx2vk::note_gpu_write(encoded.raw);
         image = &encoded.raw;
+    } else if (scan_copy_enabled() && scan.image.image) {
+        auto& copy = s_scan_copy[gamepad];
+        if (!copy.image || copy.desc.width != scan.image.desc.width || copy.desc.height != scan.image.desc.height ||
+            copy.desc.format != scan.image.desc.format) {
+            gx2vk::destroy_image(copy);
+            gx2vk::ImageDesc desc;
+            desc.width = scan.image.desc.width; desc.height = scan.image.desc.height;
+            desc.format = scan.image.desc.format;
+            desc.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            gx2vk::create_image(copy, desc);
+        }
+        end_rendering();
+        VkCommandBuffer cb = gx2vk::cmd();
+        gx2vk::barrier_if_dirty();
+        VkImageCopy region{};
+        region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {scan.image.desc.width, scan.image.desc.height, 1};
+        vkCmdCopyImage(cb, scan.image.image, VK_IMAGE_LAYOUT_GENERAL, copy.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        gx2vk::note_gpu_write(copy);
+        image = &copy;
     }
     const unsigned index = gamepad ? 1 : 0;
     S.scan_source[index] = &scan;
@@ -1968,13 +2141,12 @@ void gx2_render_copy_to_scan(uint32_t cb_addr, uint32_t scan_target, uint8_t* me
     S.scan_w[index] = scan.image.desc.width; S.scan_h[index] = scan.image.desc.height;
 }
 
-#ifndef RBREW_DISABLE_LOGGING
 // Writes one BMP from a raw image readback; shared by interval dumps and glitch captures.
 static bool write_frame_bmp(VkFormat format, uint32_t width, uint32_t height, const uint8_t* raw, const char* name) {
-    static const char* const directory = rbrew_diagnostic_env("RBREW_FRAME_DUMP_DIR");  // read once
+    const char* const directory = std::getenv("RBREW_FRAME_DUMP_DIR");
     if (!directory || !*directory) return false;
-    // RBREW_FRAME_DUMP_SCALE=<n>: integer downsample factor for the BMP.
-    static const unsigned scale = [] { const char* v = rbrew_diagnostic_env("RBREW_FRAME_DUMP_SCALE"); unsigned n = v ? unsigned(std::strtoul(v, nullptr, 10)) : 0u; return n ? n : 1u; }();
+    const char* v_scale = std::getenv("RBREW_FRAME_DUMP_SCALE");
+    const unsigned scale = v_scale ? std::max(1u, unsigned(std::strtoul(v_scale, nullptr, 10))) : 1u;
     const uint32_t outW = std::max(1u, width / scale), outH = std::max(1u, height / scale);
     const unsigned stride = (outW * 3 + 3) & ~3u;
     std::vector<uint8_t> pixels(size_t(stride) * outH);
@@ -1991,25 +2163,25 @@ static bool write_frame_bmp(VkFormat format, uint32_t width, uint32_t height, co
     auto put = [&](unsigned offset, uint32_t value) { for (unsigned i = 0; i < 4; ++i) header[offset + i] = uint8_t(value >> (i * 8)); };
     put(2, 54 + uint32_t(pixels.size())); put(10, 54); put(14, 40); put(18, outW); put(22, uint32_t(-int32_t(outH)));
     header[26] = 1; header[28] = 24; put(34, uint32_t(pixels.size()));
-    char path[1024]; std::snprintf(path, sizeof(path), "%s/%s.bmp", directory, name);
-    if (FILE* f = std::fopen(path, "wb")) { std::fwrite(header.data(), 1, header.size(), f); std::fwrite(pixels.data(), 1, pixels.size(), f); std::fclose(f); }
-    RBREW_LOGF(stderr, "[frame] captured %s size=%ux%u scale=%u\n", name, outW, outH, scale);
+    char out_path[1024]; std::snprintf(out_path, sizeof(out_path), "%s/%s.bmp", directory, name);
+    if (FILE* f = std::fopen(out_path, "wb")) { std::fwrite(header.data(), 1, header.size(), f); std::fwrite(pixels.data(), 1, pixels.size(), f); std::fclose(f); }
     return true;
 }
 
-static void dump_frame(gx2vk::Image& image, uint32_t width, uint32_t height) {
-    static const char* const directory = rbrew_diagnostic_env("RBREW_FRAME_DUMP_DIR");  // read once
+static void dump_frame(gx2vk::Image& image, uint32_t width, uint32_t height, const char* prefix = "frame") {
+    static const char* const directory = std::getenv("RBREW_FRAME_DUMP_DIR");   // per present: read once
     if (!directory || !*directory) return;
-    static unsigned frame = 0; ++frame;
-    // RBREW_FRAME_DUMP_EVERY=<n>: dump every n-th present (default 1/60/300).
-    static const unsigned every = [] { const char* v = rbrew_diagnostic_env("RBREW_FRAME_DUMP_EVERY"); return v ? unsigned(std::strtoul(v, nullptr, 10)) : 0u; }();
-    if (every) { if (frame != 1 && frame % every) return; }
-    else if (!(frame == 1 || frame == 60 || frame % 300 == 0)) return;
+    const unsigned frame = rbrew_benchmark::frame.load(std::memory_order_relaxed);
+    static const unsigned every = [] { const char* v = std::getenv("RBREW_FRAME_DUMP_EVERY"); return v ? unsigned(std::strtoul(v, nullptr, 10)) : 30u; }();
+    if (!every || ((frame % every != 0) && frame != 1)) return;
     std::vector<uint8_t> raw;
     if (!gx2vk::read_image(image, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, width, height, raw)) return;
-    char name[32]; std::snprintf(name, sizeof(name), "frame_%05u", frame);
+    rbrew_benchmark::captured_frame.store(rbrew_benchmark::frame.load(), std::memory_order_relaxed);
+    char name[64]; std::snprintf(name, sizeof(name), "%s_%05u", prefix, frame);
     write_frame_bmp(image.desc.format, width, height, raw.data(), name);
 }
+
+#ifndef RBREW_DISABLE_LOGGING
 
 // RBREW_FRAME_SIG=1: one brightness line per present for flicker timelines.
 // Note: read_image(level, layer) copies the whole image from the origin, so sample probes on CPU.
@@ -2071,7 +2243,6 @@ static void frame_signature(gx2vk::Image& image, uint32_t width, uint32_t height
     RBREW_LOGF(stderr, "[sig] %u g=%u a=%u b=%u%s\n", seq, gamepad ? 1u : 0u, a, b, dev > 25 ? " GLITCH" : "");
 }
 #else
-static void dump_frame(gx2vk::Image&, uint32_t, uint32_t) {}
 static void frame_signature(gx2vk::Image&, uint32_t, uint32_t, bool) {}
 #endif
 
@@ -2126,6 +2297,9 @@ void gx2_render_present(void* sdl_window, bool gamepad_mode) {
         source = &s_present_raw;
     }
     if (source && source->image && w && h) { frame_signature(*source, w, h, gamepad_mode); dump_frame(*source, w, h); }
+    static const bool dump_gamepad = std::getenv("RBREW_FRAME_DUMP_GAMEPAD") != nullptr;
+    if (dump_gamepad && S.scan_image[1] && *S.scan_image[1] && S.scan_w[1] && S.scan_h[1])
+        dump_frame(*S.scan_image[1], S.scan_w[1], S.scan_h[1], "gamepad");
     if (gx2vk::has_surface()) {
         static gx2vk::Image none;
 #ifndef RBREW_DISABLE_LOGGING
@@ -2633,3 +2807,5 @@ std::vector<uint8_t> gx2_render_vk_test_splash_canvas() {
     return canvas;
 }
 #endif
+
+uint64_t gx2_render_completed_serial() { return gx2vk::known_completed_serial(); }

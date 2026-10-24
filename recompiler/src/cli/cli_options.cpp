@@ -26,6 +26,9 @@ void print_usage(const char* prog) {
         "  -v          Verbose output\n"
         "  --no-color  Disable coloured output\n"
         "  --emit-ppc-image  Emit relocated executable image for hybrid prototype\n"
+        "  --emit-coverage   Emit RBREW_COVERAGE_* probes (needs RBREW_ENABLE_COVERAGE=ON)\n"
+        "  --hooks F         Guest entries that get a host-hook wrapper (hex per line)\n"
+        "  -F, --functions-per-file N  Max functions per generated shard\n"
         "  --hints-file F    Diagnostic only: force extra entries (hex address per line)\n";
 }
 
@@ -80,6 +83,10 @@ std::optional<CliOptions> parse(int argc, char** argv) {
             opts.hints_file = argv[++i];
         } else if (arg == "--emit-ppc-image") {
             opts.emit_ppc_image = true;
+        } else if (arg == "--emit-coverage") {
+            opts.emit_coverage = true;
+        } else if ((arg == "--functions-per-file" || arg == "-F") && i + 1 < argc) {
+            opts.functions_per_file = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg.starts_with("-")) {
             std::cerr << "unknown option: " << arg << "\n";
             return {};

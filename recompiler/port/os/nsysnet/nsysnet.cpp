@@ -47,6 +47,9 @@ typedef int              ssize_t;
 #endif
 
 #include <string.h>
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
 #include <stdio.h>
 
 // ---------------------------------------------------------------------------
@@ -549,16 +552,26 @@ static void freeaddrinfo_(CPUState* cpu) { (void)cpu; }
 // nn_ac (network availability) — always report connected
 // ---------------------------------------------------------------------------
 static void ac_Initialize(CPUState* cpu)               { (void)cpu; RET = 0; }
-static void ac_Connect(CPUState* cpu)                  { (void)cpu; RET = 0; }
+// Connect() reported success while IsApplicationConnected() reported offline.
+// Gambit (02A7B5A4) then started its NEX/Pia online login, found no server
+// and the boot loading screen waited for the game's 30 s online timeout. Like a
+// console without internet, Connect now fails (sign bit set; the description
+// value is the port's choice) and the game boots offline at once.
+// RBREW_AC_CONNECT=ok restores the old success result.
+static constexpr uint32_t kAcResultNotConnected = 0xA0D1F400u;
+static void ac_Connect(CPUState* cpu) {
+    static const bool ok = [] { const char* v = std::getenv("RBREW_AC_CONNECT"); return v && !strcmp(v, "ok"); }();
+    RET = ok ? 0u : kAcResultNotConnected;
+}
 static void ac_Close(CPUState* cpu)                    { (void)cpu; RET = 0; }
 static void ac_GetLastErrorCode(CPUState* cpu)         { if (ARG0) rbrew_write32(MEM, ARG0, 0u); RET = 0; }
 static void ac_GetAssignedAddress(CPUState* cpu)       { if (ARG0) rbrew_write32(MEM, ARG0, 0u); RET = 0; }
 static void ac_GetAssignedSubnet(CPUState* cpu)        { if (ARG0) rbrew_write32(MEM, ARG0, 0u); RET = 0; }
 
-// IsApplicationConnected(bool* result)  → *result = TRUE; return 0
+// IsApplicationConnected(bool* result)  → *result = FALSE (offline mode); return 0
 static void ac_IsApplicationConnected(CPUState* cpu) {
     if (ARG0 && rbrew_memory_accessible(MEM,ARG0,1u))
-        MEM[ARG0] = 1u; // *result = true
+        MEM[ARG0] = 0u; // *result = false (offline mode: prevents lobby network hangs)
     RET = 0;
 }
 
@@ -576,46 +589,63 @@ static void curl_global_cleanup_(CPUState* cpu)   { (void)cpu; }
 // ---------------------------------------------------------------------------
 #include "../stubs/stubs_addrs.h"
 
+// RBREW_NET_TRACE=<file>: every socket/nn_ac call with its arguments, result
+// and host error, plus a timestamp, for diagnosing network waits.
+static void net_trace(const char* name, CPUState* cpu, uint32_t a0, uint32_t a1, uint32_t a2) {
+    static FILE* const file = [] { const char* p = std::getenv("RBREW_NET_TRACE"); return p && *p ? std::fopen(p, "w") : nullptr; }();
+    if (!file) return;
+    const int error = SOCK_ERRNO;
+    static const auto start = std::chrono::steady_clock::now();
+    static std::mutex lock;
+    std::lock_guard guard(lock);
+    std::fprintf(file, "%9.3f %-24s %08X %08X %08X -> %08X err=%d\n",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
+                 name, a0, a1, a2, RET, error);
+    std::fflush(file);
+}
+#define NET_REG(addr, fn) rbrew_register_func(cpu, addr, [](CPUState* cpu) { \
+        const uint32_t a0 = ARG0, a1 = ARG1, a2 = ARG2; fn(cpu); net_trace(#fn, cpu, a0, a1, a2); })
+
 void nsysnet_register(CPUState* cpu) {
     // nsysnet core
-    rbrew_register_func(cpu, ADDR_socket_lib_init,       socket_lib_init);
-    rbrew_register_func(cpu, ADDR_NSSLInit,              NSSLInit);
-    rbrew_register_func(cpu, ADDR_set_resolver_allocator,set_resolver_allocator);
-    rbrew_register_func(cpu, ADDR_mw_socket,             mw_socket);
-    rbrew_register_func(cpu, ADDR_socketclose,           socketclose);
-    rbrew_register_func(cpu, ADDR_socketlasterr,         socketlasterr);
-    rbrew_register_func(cpu, ADDR_bind,                  bind_);
-    rbrew_register_func(cpu, ADDR_shutdown,              shutdown_);
-    rbrew_register_func(cpu, ADDR_getsockname,           getsockname_);
-    rbrew_register_func(cpu, ADDR_send,                  send_);
-    rbrew_register_func(cpu, ADDR_recv,                  recv_);
-    rbrew_register_func(cpu, ADDR_sendto,                sendto_);
-    rbrew_register_func(cpu, ADDR_recvfrom,              recvfrom_);
-    rbrew_register_func(cpu, ADDR_recvfrom_ex,           recvfrom_ex);
-    rbrew_register_func(cpu, ADDR_sendto_multi,          sendto_multi);
-    rbrew_register_func(cpu, ADDR_select,                select_);
-    rbrew_register_func(cpu, ADDR_setsockopt,            setsockopt_);
+    NET_REG(ADDR_socket_lib_init,       socket_lib_init);
+    NET_REG(ADDR_NSSLInit,              NSSLInit);
+    NET_REG(ADDR_set_resolver_allocator,set_resolver_allocator);
+    NET_REG(ADDR_mw_socket,             mw_socket);
+    NET_REG(ADDR_socketclose,           socketclose);
+    NET_REG(ADDR_socketlasterr,         socketlasterr);
+    NET_REG(ADDR_bind,                  bind_);
+    NET_REG(ADDR_shutdown,              shutdown_);
+    NET_REG(ADDR_getsockname,           getsockname_);
+    NET_REG(ADDR_send,                  send_);
+    NET_REG(ADDR_recv,                  recv_);
+    NET_REG(ADDR_sendto,                sendto_);
+    NET_REG(ADDR_recvfrom,              recvfrom_);
+    NET_REG(ADDR_recvfrom_ex,           recvfrom_ex);
+    NET_REG(ADDR_sendto_multi,          sendto_multi);
+    NET_REG(ADDR_select,                select_);
+    NET_REG(ADDR_setsockopt,            setsockopt_);
     // Note: connect/accept/listen are not in this game's PLT
-    rbrew_register_func(cpu, ADDR_htonl,                 htonl_);
-    rbrew_register_func(cpu, ADDR_htons,                 htons_);
-    rbrew_register_func(cpu, ADDR_ntohl,                 ntohl_);
-    rbrew_register_func(cpu, ADDR_ntohs,                 ntohs_);
-    rbrew_register_func(cpu, ADDR_inet_ntoa,             inet_ntoa_);
-    rbrew_register_func(cpu, ADDR_inet_pton,             inet_pton_);
-    rbrew_register_func(cpu, ADDR_gethostbyname,         gethostbyname_);
-    rbrew_register_func(cpu, ADDR_getaddrinfo,           getaddrinfo_);
-    rbrew_register_func(cpu, ADDR_freeaddrinfo,          freeaddrinfo_);
+    NET_REG(ADDR_htonl,                 htonl_);
+    NET_REG(ADDR_htons,                 htons_);
+    NET_REG(ADDR_ntohl,                 ntohl_);
+    NET_REG(ADDR_ntohs,                 ntohs_);
+    NET_REG(ADDR_inet_ntoa,             inet_ntoa_);
+    NET_REG(ADDR_inet_pton,             inet_pton_);
+    NET_REG(ADDR_gethostbyname,         gethostbyname_);
+    NET_REG(ADDR_getaddrinfo,           getaddrinfo_);
+    NET_REG(ADDR_freeaddrinfo,          freeaddrinfo_);
 
     // nn_ac (C++ mangled names → use addresses directly)
-    rbrew_register_func(cpu, ADDR_Initialize__Q2_2nn2acFv,              ac_Initialize);
-    rbrew_register_func(cpu, ADDR_Connect__Q2_2nn2acFv,                 ac_Connect);
-    rbrew_register_func(cpu, ADDR_Close__Q2_2nn2acFv,                   ac_Close);
-    rbrew_register_func(cpu, ADDR_GetLastErrorCode__Q2_2nn2acFPUi,      ac_GetLastErrorCode);
-    rbrew_register_func(cpu, ADDR_GetAssignedAddress__Q2_2nn2acFPUl,    ac_GetAssignedAddress);
-    rbrew_register_func(cpu, ADDR_GetAssignedSubnet__Q2_2nn2acFPUl,     ac_GetAssignedSubnet);
-    rbrew_register_func(cpu, ADDR_IsApplicationConnected__Q2_2nn2acFPb, ac_IsApplicationConnected);
+    NET_REG(ADDR_Initialize__Q2_2nn2acFv,              ac_Initialize);
+    NET_REG(ADDR_Connect__Q2_2nn2acFv,                 ac_Connect);
+    NET_REG(ADDR_Close__Q2_2nn2acFv,                   ac_Close);
+    NET_REG(ADDR_GetLastErrorCode__Q2_2nn2acFPUi,      ac_GetLastErrorCode);
+    NET_REG(ADDR_GetAssignedAddress__Q2_2nn2acFPUl,    ac_GetAssignedAddress);
+    NET_REG(ADDR_GetAssignedSubnet__Q2_2nn2acFPUl,     ac_GetAssignedSubnet);
+    NET_REG(ADDR_IsApplicationConnected__Q2_2nn2acFPb, ac_IsApplicationConnected);
 
     // nlibcurl lifecycle
-    rbrew_register_func(cpu, ADDR_curl_global_init_mem,  curl_global_init_mem_);
-    rbrew_register_func(cpu, ADDR_curl_global_cleanup,   curl_global_cleanup_);
+    NET_REG(ADDR_curl_global_init_mem,  curl_global_init_mem_);
+    NET_REG(ADDR_curl_global_cleanup,   curl_global_cleanup_);
 }
