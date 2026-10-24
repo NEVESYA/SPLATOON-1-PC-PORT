@@ -2,6 +2,7 @@
 #include "../stubs/stubs_addrs.h"
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -94,6 +95,17 @@ void GetAccountId(CPUState* cpu) {
     rbrew_write8(cpu->mem, cpu->r[3], 0);
     cpu->r[3] = 0;
 }
+// AcquireNexServiceToken(ACTNexAuthenticationResult*, gameServerId). The
+// blank STUB left r3 as the (positive) output pointer, which Gambit 02B32E5C
+// read as success: it then logged in to NEX with an empty token and the boot
+// loading screen waited ~30 s for that login's timeout alarm. The offline
+// account has no NNID, so fail like a console without a network account.
+// RBREW_NEX_TOKEN=stub restores the old behaviour.
+void AcquireNexServiceToken(CPUState* cpu) {
+    static const bool stub = [] { const char* v = std::getenv("RBREW_NEX_TOKEN"); return v && std::string_view(v) == "stub"; }();
+    if (stub) return;
+    cpu->r[3] = RBREW_ACT_RESULT_NEX_UNAVAILABLE;
+}
 }
 
 uint16_t rbrew_ffl_crc16(const uint8_t* data, size_t length) {
@@ -152,5 +164,6 @@ void nn_act_register(CPUState* cpu) {
     ACT_REG(GetCountry, GetCountry__Q2_2nn3actFPc);
     ACT_REG(GetAccountId, GetAccountId__Q2_2nn3actFPc);
     ACT_REG(GetParentalControlSlotNoEx, GetParentalControlSlotNoEx__Q2_2nn3actFPUcUc);
+    ACT_REG(AcquireNexServiceToken, AcquireNexServiceToken__Q2_2nn3actFP26ACTNexAuthenticationResultUi);
 }
 #undef ACT_REG

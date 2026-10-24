@@ -331,11 +331,47 @@ EntryTrace* entry_trace() {
 // checking both diagnostics' function-local statics and building a profiler
 // scope. Fixed before guest code runs.
 namespace {
+// RBREW_IMPORT_TRACE=<file> (release builds too): calls per import slot with
+// the first/last call time, rewritten every 2 s, to find what a stalled
+// game polls. Slots are 0x02D00000-based PLT addresses.
+const char* const import_trace_path = [] { const char* p = std::getenv("RBREW_IMPORT_TRACE"); return p && *p ? p : nullptr; }();
 const bool dispatch_instrumented = [] {
     const char* trace = rbrew_diagnostic_env("RBREW_ENTRY_TRACE");
     const char* profile = rbrew_diagnostic_env("RBREW_IMPORT_PROFILE");
-    return (trace && *trace) || (profile && *profile && *profile != '0');
+    return (trace && *trace) || (profile && *profile && *profile != '0') || import_trace_path;
 }();
+void import_trace(CPUState* cpu, uint32_t guest_addr) {
+    if (!import_trace_path || guest_addr < 0x02D00000u || guest_addr >= 0x02E00000u) return;
+    struct Slot { uint64_t calls = 0; double first = 0, last = 0; uint32_t chain[4]{}; };
+    static std::mutex lock;
+    static std::unordered_map<uint32_t, Slot> slots;
+    static const auto start = std::chrono::steady_clock::now();
+    static auto last_dump = start;
+    std::lock_guard guard(lock);
+    const auto now = std::chrono::steady_clock::now();
+    const double t = std::chrono::duration<double>(now - start).count();
+    Slot& slot = slots[guest_addr];
+    if (!slot.calls++) {
+        slot.first = t;
+        // First caller's guest return addresses (lr, then saved LRs up the back chain).
+        slot.chain[0] = cpu->lr;
+        for (uint32_t i = 1, sp = cpu->r[1]; i < 4; ++i) {
+            if (!rbrew_memory_accessible(cpu->mem, sp, 4)) break;
+            sp = rbrew_read32(cpu->mem, sp);
+            if (!sp || !rbrew_memory_accessible(cpu->mem, sp + 4, 4)) break;
+            slot.chain[i] = rbrew_read32(cpu->mem, sp + 4);
+        }
+    }
+    slot.last = t;
+    if (now - last_dump < std::chrono::seconds(2)) return;
+    last_dump = now;
+    if (FILE* f = std::fopen(import_trace_path, "w")) {
+        for (const auto& [addr, s] : slots)
+            std::fprintf(f, "%08X %llu %.2f %.2f %08X %08X %08X %08X\n", addr, (unsigned long long)s.calls, s.first, s.last,
+                         s.chain[0], s.chain[1], s.chain[2], s.chain[3]);
+        std::fclose(f);
+    }
+}
 }
 
 void rbrew_dispatch(CPUState* cpu, uint32_t guest_addr) {
@@ -356,6 +392,7 @@ void rbrew_dispatch(CPUState* cpu, uint32_t guest_addr) {
         if (trace->seen.insert(guest_addr).second)
             RBREW_LOGF(stderr, "[entry] reached %08X lr=%08X r3=%08X r4=%08X\n", guest_addr, cpu->lr, cpu->r[3], cpu->r[4]);
     }
+    import_trace(cpu, guest_addr);
     InsideImport inside_import;
     if (ImportProfile* profile = import_profile_start()) {
         ProfiledThread* thread = profiled_thread(profile, cpu);

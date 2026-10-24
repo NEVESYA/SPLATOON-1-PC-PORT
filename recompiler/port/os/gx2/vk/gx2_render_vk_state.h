@@ -104,6 +104,7 @@ struct DepthTarget {             // DepthEntry
     bool stencil = false;
     uint32_t id = 0;
 };
+using ColorImageKey = std::array<uint32_t, 9>;
 struct Texture {                 // TexEntry
     gx2vk::Image image;
     TexObject tex;
@@ -115,12 +116,16 @@ struct Texture {                 // TexEntry
     // Reuse only while both source and destination contents are unchanged.
     std::map<uint32_t, uint64_t> copied_sources;
     uint64_t copied_destination = 0;
+    // Shared across slots/material switches; these point to live map nodes,
+    // so changing GPU contents never needs a stale sampled-image shortcut.
+    std::vector<const std::map<ColorImageKey, ColorTarget>::value_type*> color_candidates;
+    std::vector<const std::map<ColorImageKey, DepthTarget>::value_type*> depth_candidates;
+    uint64_t color_revision = UINT64_MAX, depth_revision = UINT64_MAX;
 };
 struct ColorView {               // glTextureView of a 32-bit-class render target
     TexObject tex;
 };
 
-using ColorImageKey = std::array<uint32_t, 9>;
 using TextureLayout = std::array<uint32_t, GX2TEX_COMP_MAP / 4>;
 using TextureKey = std::pair<uintptr_t, TextureLayout>;
 
@@ -260,6 +265,7 @@ struct State {
     // cached ranges; texture nodes retain their addresses across insertion.
     ImageViewRanges<ColorTarget> color_ranges;
     ImageViewRanges<DepthTarget> depth_ranges;
+    uint64_t color_view_revision = 0, depth_view_revision = 0;
     std::array<TextureEntryCache, 96> texture_entries{};
     std::unordered_map<TextureEntryIndexKey, Texture*, TextureEntryIndexHash> texture_entry_index;
     // Address index of tex_map image/mip ranges for gx2_render_invalidate_textures,

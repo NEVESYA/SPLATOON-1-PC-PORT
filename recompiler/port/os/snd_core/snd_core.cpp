@@ -121,7 +121,13 @@ struct AXVoiceState {
     uint16_t adpcm_pred_scale = 0, adpcm_loop_pred_scale = 0;
     float adpcm_sample = 0;
     bool adpcm_sample_valid = false;
+
+    // Per-voice filters (applied after sample-rate conversion, before volume).
+    bool lpf_on = false;   float lpf_a0 = 1, lpf_b0 = 0, lpf_y1 = 0;            // Q15
+    bool biquad_on = false;                                                   // Q14
+    float bq_b0 = 1, bq_b1 = 0, bq_b2 = 0, bq_a1 = 0, bq_a2 = 0, bq_x1 = 0, bq_x2 = 0, bq_y1 = 0, bq_y2 = 0;
 };
+static float apply_voice_filters(AXVoiceState& v,float x);
 
 static AXVoiceState s_voices[AX_VOICE_COUNT];
 static uint8_t*     s_mem = nullptr;       // guest arena (set at AXInit time)
@@ -275,8 +281,8 @@ static void ax_mix_voices(float* out,uint32_t frames) {
         }
         for(unsigned f=0;f<frames && v.playing.load();++f) {
             const float current=sample_at(v);
-            const float sample=v.src_type && v.pos_frac>0?
-                current+(next_sample(v,current)-current)*v.pos_frac:current;
+            const float sample=apply_voice_filters(v,v.src_type && v.pos_frac>0?
+                current+(next_sample(v,current)-current)*v.pos_frac:current);
             for(unsigned r=0;r<route_count;++r) {
                 auto& route=routes[r];route.output[f]+=sample*v.vol*(*route.gain);
                 *route.gain=std::clamp(*route.gain+route.delta,0.0f,65535.0f/32768.0f);
@@ -601,6 +607,8 @@ static void reset_voice(unsigned index) {
     std::fill_n(v.adpcm_coefs,16,int16_t(0));
     v.adpcm_hist1=v.adpcm_hist2=v.adpcm_loop_hist1=v.adpcm_loop_hist2=0;
     v.adpcm_pred_scale=v.adpcm_loop_pred_scale=0;
+    v.lpf_on=false;v.lpf_a0=1;v.lpf_b0=0;v.lpf_y1=0;
+    v.biquad_on=false;v.bq_b0=1;v.bq_b1=v.bq_b2=v.bq_a1=v.bq_a2=0;v.bq_x1=v.bq_x2=v.bq_y1=v.bq_y2=0;
     std::memset(s_mem+voice_handle(index),0,AX_VOICE_HANDLE_STRIDE);
     rbrew_write32(s_mem,voice_handle(index),index);
 }
@@ -738,6 +746,69 @@ static void AXSetVoiceVe(CPUState* cpu) {
     const int i=voice_index(ARG0);if(i<0 || !ARG1 || !audio_bytes(ARG1,4)) return;
     s_voices[i].vol=float(rbrew_read16(MEM,ARG1))/32768.0f;
     s_voices[i].vol_delta=float(int16_t(rbrew_read16(MEM,ARG1+2)))/32768.0f;
+}
+// Voice low-pass and biquad filters. They were STUBs, so effects the game
+// drives through them (e.g. music layers opened up during the tutorial) never
+// changed the sound. RBREW_AX_FILTERS=0 ignores them again.
+static bool ax_filters_enabled() {
+    static const bool on = [] { const char* v = std::getenv("RBREW_AX_FILTERS"); return !(v && v[0] == '0'); }();
+    return on;
+}
+// AXPBLPF: u16 on, s16 yn1, u16 a0, u16 b0 (Q15): y = a0*x + b0*y[n-1].
+static void AXSetVoiceLpf(CPUState* cpu) {
+    const int i=voice_index(ARG0);if(i<0 || !ARG1 || !audio_bytes(ARG1,8)) return;
+    auto& v=s_voices[i];
+    v.lpf_on=rbrew_read16(MEM,ARG1)!=0;
+    v.lpf_y1=float(int16_t(rbrew_read16(MEM,ARG1+2)))/32768.0f;
+    v.lpf_a0=float(rbrew_read16(MEM,ARG1+4))/32768.0f;
+    v.lpf_b0=float(rbrew_read16(MEM,ARG1+6))/32768.0f;
+}
+static void AXSetVoiceLpfCoefs(CPUState* cpu) {
+    const int i=voice_index(ARG0);if(i<0) return;
+    s_voices[i].lpf_a0=float(ARG1&0xFFFFu)/32768.0f;s_voices[i].lpf_b0=float(ARG2&0xFFFFu)/32768.0f;
+}
+// AXComputeLpfCoefs(freq, u16* a0, u16* b0): one-pole low-pass at `freq` Hz
+// for the 32 kHz DSP rate, in the form AXSetVoiceLpf uses above.
+static void AXComputeLpfCoefs(CPUState* cpu) {
+    constexpr double kPi = 3.14159265358979323846;
+    const double b = 2.0 - std::cos(2.0 * kPi * (std::min)(double(ARG0), 16000.0) / 32000.0);
+    const double k = (std::clamp)(b - std::sqrt((std::max)(0.0, b * b - 1.0)), 0.0, 32767.0 / 32768.0);   // feedback
+    if (ARG1 && audio_bytes(ARG1, 2)) rbrew_write16(MEM, ARG1, uint16_t(std::lround((1.0 - k) * 32768.0) & 0xFFFF));
+    if (ARG2 && audio_bytes(ARG2, 2)) rbrew_write16(MEM, ARG2, uint16_t(std::lround(k * 32768.0)));
+}
+// AXPBBIQUAD: u16 on, s16 xn1, xn2, yn1, yn2, b0, b1, b2, a1, a2 (Q14):
+// y = b0*x + b1*x1 + b2*x2 + a1*y1 + a2*y2 (feedback stored with its sign).
+static void set_biquad(AXVoiceState& v,int16_t b0,int16_t b1,int16_t b2,int16_t a1,int16_t a2) {
+    v.bq_b0=b0/16384.0f;v.bq_b1=b1/16384.0f;v.bq_b2=b2/16384.0f;v.bq_a1=a1/16384.0f;v.bq_a2=a2/16384.0f;
+}
+static void AXSetVoiceBiquad(CPUState* cpu) {
+    const int i=voice_index(ARG0);if(i<0 || !ARG1 || !audio_bytes(ARG1,20)) return;
+    auto& v=s_voices[i];
+    auto s=[&](uint32_t o){return int16_t(rbrew_read16(MEM,ARG1+o));};
+    v.biquad_on=rbrew_read16(MEM,ARG1)!=0;
+    v.bq_x1=s(2)/32768.0f;v.bq_x2=s(4)/32768.0f;v.bq_y1=s(6)/32768.0f;v.bq_y2=s(8)/32768.0f;
+    set_biquad(v,s(10),s(12),s(14),s(16),s(18));
+}
+static void AXSetVoiceBiquadCoefs(CPUState* cpu) {
+    const int i=voice_index(ARG0);if(i<0) return;
+    set_biquad(s_voices[i],int16_t(ARG1),int16_t(ARG2),int16_t(ARG3),int16_t(ARG4),int16_t(ARG5));
+}
+static float apply_voice_filters(AXVoiceState& v,float x) {
+    if(!ax_filters_enabled()) return x;
+    if(v.biquad_on) {
+        float y=v.bq_b0*x+v.bq_b1*v.bq_x1+v.bq_b2*v.bq_x2+v.bq_a1*v.bq_y1+v.bq_a2*v.bq_y2;
+        if(!std::isfinite(y) || std::fabs(y)>8.0f) {   // unstable coefficients: drop the filter, not the voice
+            v.biquad_on=false;v.bq_x1=v.bq_x2=v.bq_y1=v.bq_y2=0;y=x;
+        } else {
+            v.bq_x2=v.bq_x1;v.bq_x1=x;v.bq_y2=v.bq_y1;v.bq_y1=y;
+        }
+        x=y;
+    }
+    if(v.lpf_on) {
+        x=v.lpf_a0*x+v.lpf_b0*v.lpf_y1;
+        v.lpf_y1=x;
+    }
+    return x;
 }
 static void AXSetVoiceAdpcm(CPUState* cpu) {
     const int i=voice_index(ARG0);if(i<0 || !ARG1 || !audio_bytes(ARG1,0x28)) return;
@@ -929,6 +1000,11 @@ void snd_core_register(CPUState* cpu) {
     REG(AXGetDeviceMode);
     REG(AXSetVoiceRmtOn);
     REG(AXSetVoiceRmtIIR);
+    REG(AXSetVoiceLpf);
+    REG(AXSetVoiceLpfCoefs);
+    REG(AXSetVoiceBiquad);
+    REG(AXSetVoiceBiquadCoefs);
+    REG(AXComputeLpfCoefs);
     REG(AXRegisterAuxCallback);
     REG(AXSetAuxReturnVolume);
 #undef REG

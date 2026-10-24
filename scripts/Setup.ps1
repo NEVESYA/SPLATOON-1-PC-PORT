@@ -12,7 +12,8 @@ param(
     [string]$GameDump,      # folder with code\, content\, meta\ from your Wii U dump
     [string]$Mlc,           # optional local system-resource source; never prompts
     [string]$Output,        # where the playable game folder is created
-    [switch]$Clean          # delete previous build outputs first
+    [switch]$Clean,         # delete previous build outputs first
+    [switch]$NonInteractive # unattended execution without interactive prompts
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,6 +54,17 @@ $FallbackFonts = @(
 # Helpers
 # ---------------------------------------------------------------------------
 $script:StepNumber = 0
+$script:StageTimings = [ordered]@{}
+$script:TotalWatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+function Time-Stage([string]$Name, [scriptblock]$Block) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        . $Block
+    } finally {
+        $script:StageTimings[$Name] = [math]::Round($sw.Elapsed.TotalSeconds, 2)
+    }
+}
 function Step([string]$Text) {
     $script:StepNumber++
     Write-Host ''
@@ -71,6 +83,7 @@ function Check-Exit([string]$What) {
     if ($LASTEXITCODE -ne 0) { Fail "$What (exit code $LASTEXITCODE)." }
 }
 function Ask-YesNo([string]$Question) {
+    if ($NonInteractive) { return $false }
     $answer = Read-Host "      $Question [Y/N]"
     return $answer -match '^(y|yes|s|sim)$'
 }
@@ -272,14 +285,35 @@ Ensure-Folder $Downloads
 
 # ---------------------------------------------------------------------------
 Step 'Checking the tools needed to build'
+$script:StepSw = [System.Diagnostics.Stopwatch]::StartNew()
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+$vsInstaller = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\setup.exe'
 $vs = $null
+$existingVs2022 = $null
+
 if (Test-Path -LiteralPath $vswhere) {
-    $found = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json | ConvertFrom-Json
-    if ($found) { $vs = @($found)[0] }
+    # 1. Check for supported Visual Studio (v17+ / VS 2022+) with VC C++ Tools already present
+    $found = & $vswhere -version '[17.0,19.0)' -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json | ConvertFrom-Json
+    if ($found -and @($found).Count -gt 0) {
+        $vs = @($found)[0]
+    } else {
+        # 2. Check if VS 2022 is installed but missing the C++ workload
+        $foundVs2022 = & $vswhere -version '[17.0,19.0)' -latest -products * -format json | ConvertFrom-Json
+        if ($foundVs2022 -and @($foundVs2022).Count -gt 0) {
+            $existingVs2022 = @($foundVs2022)[0]
+            Warn "Found $($existingVs2022.displayName) ($($existingVs2022.installationVersion)), but the C++ Build Tools workload is missing."
+        } else {
+            # Check if an older version (e.g. VS 2019) is installed
+            $foundAny = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json | ConvertFrom-Json
+            if ($foundAny -and @($foundAny).Count -gt 0) {
+                $oldVs = @($foundAny)[0]
+                Warn "Found $($oldVs.displayName) (version $($oldVs.installationVersion)), but Visual Studio 2022 (v17) or newer is required."
+            }
+        }
+    }
 }
 $python = $null
-foreach ($candidate in @(@('py', '-3'), @('python'))) {
+foreach ($candidate in @(@('py', '-3'), @('python'), @('python3'))) {
     if (-not (Get-Command $candidate[0] -ErrorAction SilentlyContinue)) { continue }
     $extra = @(); if ($candidate.Count -gt 1) { $extra = $candidate[1..($candidate.Count - 1)] }
     $ok = $null
@@ -291,20 +325,87 @@ foreach ($candidate in @(@('py', '-3'), @('python'))) {
 }
 $git = Get-Command git -ErrorAction SilentlyContinue
 
+$cmake = $null
+if ($vs) {
+    $vsCmake = Join-Path $vs.installationPath 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+    if (Test-Path -LiteralPath $vsCmake) { $cmake = $vsCmake }
+}
+if (-not $cmake) {
+    $cmakeCmd = Get-Command cmake -ErrorAction SilentlyContinue
+    if ($cmakeCmd) { $cmake = $cmakeCmd.Source }
+}
+
 $missing = @()
-if (-not $vs) { $missing += @{ Name = 'Visual Studio 2022 Build Tools (C++ workload)'; Id = 'Microsoft.VisualStudio.2022.BuildTools'; Extra = '--override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"' } }
-if (-not $python) { $missing += @{ Name = 'Python 3.12'; Id = 'Python.Python.3.12'; Extra = '' } }
-if (-not $git) { $missing += @{ Name = 'Git'; Id = 'Git.Git'; Extra = '' } }
-if ($missing.Count) {
-    Warn 'These programs are missing:'
-    foreach ($m in $missing) { Warn "  - $($m.Name)" }
-    if ((Get-Command winget -ErrorAction SilentlyContinue) -and (Ask-YesNo 'Install them now automatically?')) {
-        foreach ($m in $missing) {
-            Info "Installing $($m.Name) ..."
-            $wingetArgs = "install --id $($m.Id) -e --accept-package-agreements --accept-source-agreements $($m.Extra)"
-            Start-Process winget -ArgumentList $wingetArgs -Wait -NoNewWindow
+if (-not $vs) {
+    if ($existingVs2022 -and (Test-Path -LiteralPath $vsInstaller)) {
+        $missing += @{
+            Name = 'C++ workload & CMake for Visual Studio 2022';
+            Type = 'VsModify';
+            InstallPath = $existingVs2022.installationPath
         }
-        Good 'Done. Close this window and run Setup.bat again so Windows picks up the new programs.'
+    } else {
+        $missing += @{
+            Name = 'Visual Studio 2022 Build Tools (C++ workload & CMake)';
+            Type = 'Winget';
+            Id = 'Microsoft.VisualStudio.2022.BuildTools';
+            Extra = '--override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.CMake.Project --includeRecommended"'
+        }
+    }
+} elseif (-not $cmake) {
+    $missing += @{
+        Name = 'CMake';
+        Type = 'Winget';
+        Id = 'Kitware.CMake';
+        Extra = ''
+    }
+}
+if (-not $python) {
+    $missing += @{
+        Name = 'Python 3.12';
+        Type = 'Winget';
+        Id = 'Python.Python.3.12';
+        Extra = ''
+    }
+}
+if (-not $git) {
+    $missing += @{
+        Name = 'Git';
+        Type = 'Winget';
+        Id = 'Git.Git';
+        Extra = ''
+    }
+}
+if ($missing.Count) {
+    Warn 'The following tools or workloads need to be installed/configured:'
+    foreach ($m in $missing) { Warn "  - $($m.Name)" }
+    if (Ask-YesNo 'Install / configure them now automatically?') {
+        foreach ($m in $missing) {
+            Info "Configuring $($m.Name) ..."
+            if ($m.Type -eq 'VsModify') {
+                $modifyArgs = "modify --installPath `"$($m.InstallPath)`" --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.CMake.Project --includeRecommended --passive --norestart"
+                Info "Launching Visual Studio Installer to add C++ build tools and CMake..."
+                Info "Please accept the Windows Administrator (UAC) prompt if it appears."
+                $proc = Start-Process -FilePath $vsInstaller -ArgumentList $modifyArgs -Verb RunAs -Wait -PassThru
+                if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+                    Fail "Visual Studio Installer exited with code $($proc.ExitCode). You can also open the 'Visual Studio Installer' app manually, click Modify on VS 2022, and check 'Desktop development with C++'."
+                }
+            } else {
+                if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+                    Fail "winget was not found. Please install $($m.Name) manually."
+                }
+                $wingetArgs = "install --id $($m.Id) -e --accept-package-agreements --accept-source-agreements $($m.Extra)"
+                $proc = Start-Process winget -ArgumentList $wingetArgs -Wait -PassThru -NoNewWindow
+                if ($proc.ExitCode -ne 0) {
+                    Warn "$($m.Name) installation exited with code $($proc.ExitCode). Retrying with administrator privileges..."
+                    $procAdmin = Start-Process winget -ArgumentList $wingetArgs -Wait -PassThru -Verb RunAs
+                    if ($procAdmin.ExitCode -ne 0) {
+                        Fail "Failed to install $($m.Name) (exit code $($procAdmin.ExitCode)). Please install it manually."
+                    }
+                }
+            }
+        }
+        Good 'Done! All required tools and workloads have been installed.'
+        Good 'Please close this window and run Setup.bat again so Windows picks up the new programs.'
         exit 0
     }
     Fail 'Install the programs listed above (see README), then run Setup.bat again.'
@@ -315,19 +416,61 @@ switch ($vsMajor) {
     18 { $generator = 'Visual Studio 18 2026' }
     default { Fail "Visual Studio version $vsMajor is not supported. Install Visual Studio 2022 (or newer) Build Tools." }
 }
-$cmake = Join-Path $vs.installationPath 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
-if (-not (Test-Path -LiteralPath $cmake)) {
-    $cmakeCommand = Get-Command cmake -ErrorAction SilentlyContinue
-    if (-not $cmakeCommand) { Fail 'CMake was not found. Re-run the Visual Studio Installer and add "C++ CMake tools for Windows".' }
-    $cmake = $cmakeCommand.Source
+if (-not $cmake) {
+    $vsCmake = Join-Path $vs.installationPath 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+    if (Test-Path -LiteralPath $vsCmake) {
+        $cmake = $vsCmake
+    } else {
+        $cmakeCommand = Get-Command cmake -ErrorAction SilentlyContinue
+        if (-not $cmakeCommand) { Fail 'CMake was not found. Re-run the Visual Studio Installer and add "C++ CMake tools for Windows".' }
+        $cmake = $cmakeCommand.Source
+    }
+}
+$ninja = $null
+$vsNinja = Join-Path $vs.installationPath 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
+if (Test-Path -LiteralPath $vsNinja) {
+    $ninja = $vsNinja
+} else {
+    $ninjaCmd = Get-Command ninja -ErrorAction SilentlyContinue
+    if ($ninjaCmd) { $ninja = $ninjaCmd.Source }
+}
+if ($ninja -and $vs) {
+    $vcvars = Join-Path $vs.installationPath 'VC\Auxiliary\Build\vcvars64.bat'
+    if (Test-Path -LiteralPath $vcvars) {
+        $envLines = cmd.exe /c "call `"$vcvars`" >nul & set"
+        foreach ($line in $envLines) {
+            if ($line -match '^([^=]+)=(.*)$') {
+                [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+            }
+        }
+    }
 }
 $pyExe = $python[0]; $pyArgs = @(); if ($python.Count -gt 1) { $pyArgs = $python[1..($python.Count - 1)] }
 Good "Visual Studio $($vs.installationVersion), $generator"
 Good "Python: $(& $pyExe @pyArgs --version)"
 Good "Git: $((& git --version))"
+$script:StageTimings['1. Toolchain & Environment Check'] = [math]::Round($script:StepSw.Elapsed.TotalSeconds, 2)
 
 # ---------------------------------------------------------------------------
 Step 'Finding your game files'
+$script:StepSw = [System.Diagnostics.Stopwatch]::StartNew()
+if (-not $GameDump) {
+    # Check known/common locations automatically before prompting
+    $candidateDumps = @(
+        (Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Downloads\Splatoon [Game] [0005000010176a00]'),
+        (Join-Path $Root 'dump'),
+        (Join-Path $Root 'game-dump')
+    )
+    foreach ($candidate in $candidateDumps) {
+        $candidateRpx = Join-Path $candidate 'code\Gambit.rpx'
+        if ((Test-Path -LiteralPath $candidateRpx -PathType Leaf) -and
+            ((File-Sha256 $candidateRpx) -eq $SupportedRpxSha256)) {
+            $GameDump = $candidate
+            Good "Automatically detected valid game dump: $GameDump"
+            break
+        }
+    }
+}
 if (-not $GameDump) {
     Info 'Select the folder of your Splatoon dump. It must contain the folders code, content and meta.'
     $GameDump = Ask-Folder 'Select your Splatoon game dump folder (contains code, content, meta)' $Root
@@ -359,9 +502,11 @@ if (-not $Output) { Fail 'No output folder was specified.' }
 if (Test-Path -LiteralPath $Output -PathType Leaf) { Fail "The output path is a file, not a folder: $Output" }
 Info "The game will be installed to: $Output"
 Prepare-WiiUResources $GameDump $Output $Mlc
+$script:StageTimings['2. Game Validation & Resources'] = [math]::Round($script:StepSw.Elapsed.TotalSeconds, 2)
 
 # ---------------------------------------------------------------------------
 Step 'Installing open-source libraries (vcpkg: zlib, curl, volk, Vulkan headers)'
+$script:StepSw = [System.Diagnostics.Stopwatch]::StartNew()
 $vcpkgRoot = Join-Path $Work 'vcpkg'
 $vcpkg = Join-Path $vcpkgRoot 'vcpkg.exe'
 if (-not (Test-Path -LiteralPath $vcpkg)) {
@@ -372,9 +517,11 @@ if (-not (Test-Path -LiteralPath $vcpkg)) {
 }
 & $vcpkg install @VcpkgPackages --triplet x64-windows --disable-metrics; Check-Exit 'Installing vcpkg libraries'
 $toolchain = Join-Path $vcpkgRoot 'scripts\buildsystems\vcpkg.cmake'
+$script:StageTimings['3. vcpkg Libraries (zlib/curl/volk)'] = [math]::Round($script:StepSw.Elapsed.TotalSeconds, 2)
 
 # ---------------------------------------------------------------------------
 Step 'Building the window and shader-compiler libraries (SDL2, glslang)'
+$script:StepSw = [System.Diagnostics.Stopwatch]::StartNew()
 $deps = Join-Path $Work 'deps'
 $sdlMarker = Join-Path $deps 'sdl2-vulkan\cmake\SDL2VulkanOnly.cmake'
 $glslangMarker = Join-Path $deps 'glslang-vulkan\lib\cmake\glslang\GlslangVulkanOnly.cmake'
@@ -384,27 +531,37 @@ if (-not ((Test-Path -LiteralPath $sdlMarker) -and (Test-Path -LiteralPath $glsl
     Download $SdlUrl $sdlZip
     Download $GlslangUrl $glslangArchive
     $sdlSource = Join-Path $Downloads 'SDL2-2.32.10'
-    if (-not (Test-Path -LiteralPath $sdlSource)) { Expand-Archive -LiteralPath $sdlZip -DestinationPath $Downloads }
+    if (-not (Test-Path -LiteralPath $sdlSource)) {
+        Info 'Extracting SDL2 source archive (fast zip)...'
+        & $pyExe @pyArgs -c "import zipfile, sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" $sdlZip $Downloads
+    }
     $depsBuild = Join-Path $Work 'deps-build'
-    if (Test-Path -LiteralPath $depsBuild) { Remove-Item -LiteralPath $depsBuild -Recurse -Force }   # restart an interrupted build cleanly
-    & $pyExe @pyArgs (Join-Path $Recompiler 'tools\build_vulkan_dependencies.py') --sdl-source $sdlSource --glslang-archive $glslangArchive --build-root $depsBuild --prefix $deps --generator $generator --cmake $cmake
+    if (Test-Path -LiteralPath $depsBuild) { Remove-Item -LiteralPath $depsBuild -Recurse -Force }
+    $cacheDir = Join-Path $Work 'cache\deps'
+    & $pyExe @pyArgs (Join-Path $Recompiler 'tools\build_vulkan_dependencies.py') --sdl-source $sdlSource --glslang-archive $glslangArchive --build-root $depsBuild --prefix $deps --generator $generator --cmake $cmake --cache-dir $cacheDir
     Check-Exit 'Building SDL2/glslang'
 }
 Good 'Libraries ready.'
+$script:StageTimings['4. SDL2 & glslang Compilers'] = [math]::Round($script:StepSw.Elapsed.TotalSeconds, 2)
 
 # ---------------------------------------------------------------------------
 Step 'Building the recompiler (RebrewU)'
+$script:StepSw = [System.Diagnostics.Stopwatch]::StartNew()
 $rebrewuBuild = Join-Path $Work 'rebrewu'
 & $cmake -S $Recompiler -B $rebrewuBuild -G $generator -A x64 "-DCMAKE_TOOLCHAIN_FILE=$toolchain" -DVCPKG_TARGET_TRIPLET=x64-windows -DREBREWU_BUILD_TESTS=OFF
 Check-Exit 'Configuring the recompiler'
-& $cmake --build $rebrewuBuild --config Release --target rebrewu --parallel
+$rebrewuBuildArgs = @('--build', $rebrewuBuild, '--config', 'Release', '--target', 'rebrewu', '--parallel')
+if ($generator -match 'Visual Studio') { $rebrewuBuildArgs += @('--', '/p:TrackFileAccess=false') }
+& $cmake @rebrewuBuildArgs
 Check-Exit 'Building the recompiler'
 $rebrewu = Get-ChildItem -LiteralPath $rebrewuBuild -Recurse -Filter rebrewu.exe | Select-Object -First 1
 if (-not $rebrewu) { Fail 'rebrewu.exe was not produced.' }
 Good "Recompiler: $($rebrewu.FullName)"
+$script:StageTimings['5. RebrewU Recompiler Build'] = [math]::Round($script:StepSw.Elapsed.TotalSeconds, 2)
 
 # ---------------------------------------------------------------------------
 Step 'Recompiling your Gambit.rpx into C++ (a few minutes)'
+$script:StepSw = [System.Diagnostics.Stopwatch]::StartNew()
 $generated = Join-Path $Work 'generated\Gambit'
 $stamp = Join-Path $Work 'generated\source.sha256'
 if (-not (Test-Path -LiteralPath $BoundaryProfile -PathType Leaf)) { Fail 'The supported-game boundary profile is missing. Extract the complete repository ZIP, including profiles, and retry.' }
@@ -414,8 +571,8 @@ if (-not (Test-Path -LiteralPath $HookProfile -PathType Leaf)) { Fail 'The suppo
 # Include it in the stamp so incomplete builds made without it regenerate.
 $current = $rpxHash + ':' + (File-Sha256 $rebrewu.FullName) + ':' + (File-Sha256 $BoundaryProfile) + ':' + (File-Sha256 $HookProfile)
 if (-not ((Complete-GeneratedModule $generated) -and (Test-Path -LiteralPath $stamp) -and ((Get-Content -LiteralPath $stamp -Raw).Trim() -eq $current))) {
-    # A fresh folder avoids stale parts from an older, larger generation.
-    if (Test-Path -LiteralPath (Join-Path $Work 'generated')) { Remove-Item -LiteralPath (Join-Path $Work 'generated') -Recurse -Force }
+    # Safe incremental regeneration: CppEmitter preserves unchanged file timestamps
+    # and safely archives obsolete parts to avoid wiping valid compilation units.
     Ensure-Folder $generated
     # Hook wrappers let the port attach opt-in host code to listed functions.
     & $rebrewu.FullName recompile --rpx $rpx --output $generated --analyzer-entries $BoundaryProfile --hooks $HookProfile
@@ -424,22 +581,51 @@ if (-not ((Complete-GeneratedModule $generated) -and (Test-Path -LiteralPath $st
     Set-Content -LiteralPath $stamp -Value $current -Encoding ASCII
 }
 Good 'Game code recompiled (stays on your PC, inside build\generated).'
+$script:StageTimings['6. RPX Decompilation to C++'] = [math]::Round($script:StepSw.Elapsed.TotalSeconds, 2)
 
 # ---------------------------------------------------------------------------
 Step 'Building the game (this is the long part: 15-60 minutes)'
+$script:StepSw = [System.Diagnostics.Stopwatch]::StartNew()
 $gameBuild = Join-Path $Work 'game'
-& $cmake -S (Join-Path $Recompiler 'port') -B $gameBuild -G $generator -A x64 "-DCMAKE_TOOLCHAIN_FILE=$toolchain" -DVCPKG_TARGET_TRIPLET=x64-windows `
-    -DRBREW_GRAPHICS_BACKEND=Vulkan "-DGAMBIT_GENERATED_DIR=$generated" "-DSDL2_DIR=$(Split-Path $sdlMarker)" "-Dglslang_DIR=$(Split-Path $glslangMarker)" `
-    -DRBREW_BUILD_GAME=ON -DRBREW_ENABLE_COVERAGE=OFF -DRBREW_ENABLE_PPC_FALLBACK=OFF -DRBREW_DIAGNOSTIC_RUNTIME=OFF -DRBREW_TEXTURE_DIAGNOSTICS=OFF
+$gameCmakeArgs = @(
+    '-S', (Join-Path $Recompiler 'port'),
+    '-B', $gameBuild,
+    "-DCMAKE_TOOLCHAIN_FILE=$toolchain",
+    '-DVCPKG_TARGET_TRIPLET=x64-windows',
+    '-DRBREW_GRAPHICS_BACKEND=Vulkan',
+    "-DGAMBIT_GENERATED_DIR=$generated",
+    "-DSDL2_DIR=$(Split-Path $sdlMarker)",
+    "-Dglslang_DIR=$(Split-Path $glslangMarker)",
+    '-DRBREW_BUILD_GAME=ON',
+    '-DRBREW_ENABLE_COVERAGE=OFF',
+    '-DRBREW_ENABLE_PPC_FALLBACK=OFF',
+    '-DRBREW_DIAGNOSTIC_RUNTIME=OFF',
+    '-DRBREW_TEXTURE_DIAGNOSTICS=OFF'
+)
+if ($ninja) {
+    $gameCmakeArgs += @('-G', 'Ninja', "-DCMAKE_MAKE_PROGRAM=$ninja", '-DCMAKE_BUILD_TYPE=Release')
+} else {
+    $gameCmakeArgs += @('-G', $generator, '-A', 'x64')
+}
+& $cmake @gameCmakeArgs
 Check-Exit 'Configuring the game'
-& $cmake --build $gameBuild --config Release --target Gambit --parallel
+if ($ninja) {
+    $workerCount = [Environment]::ProcessorCount
+    $gameBuildArgs = @('--build', $gameBuild, '--target', 'Gambit', '--', '-j', "$workerCount")
+} else {
+    $gameBuildArgs = @('--build', $gameBuild, '--config', 'Release', '--target', 'Gambit', '--parallel')
+    if ($generator -match 'Visual Studio') { $gameBuildArgs += @('--', '/p:TrackFileAccess=false') }
+}
+& $cmake @gameBuildArgs
 Check-Exit 'Building the game'
-$exe = Get-ChildItem -LiteralPath $gameBuild -Recurse -Filter Splatoon.exe | Where-Object { $_.FullName -match '\\Release\\' } | Select-Object -First 1
+$exe = Get-ChildItem -LiteralPath $gameBuild -Recurse -Filter Splatoon.exe | Select-Object -First 1
 if (-not $exe) { Fail 'Splatoon.exe was not produced.' }
 Good "Built: $($exe.FullName)"
+$script:StageTimings['7. Game Compilation & Linking'] = [math]::Round($script:StepSw.Elapsed.TotalSeconds, 2)
 
 # ---------------------------------------------------------------------------
 Step 'Creating the game folder'
+$script:StepSw = [System.Diagnostics.Stopwatch]::StartNew()
 Ensure-Folder $Output
 Initialize-WiiUFolders $Output
 Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $Output 'Splatoon.exe') -Force
@@ -459,6 +645,7 @@ Copy-Tree (Join-Path $GameDump 'content') (Join-Path $Output 'content')
 Copy-Tree (Join-Path $GameDump 'meta') (Join-Path $Output 'meta')
 Good 'Wii U folders ready. No existing game or Mii saves were imported.'
 Good 'A new installation starts fresh; progress already in this output folder is kept on updates.'
+$script:StageTimings['8. Game Folder Packaging'] = [math]::Round($script:StepSw.Elapsed.TotalSeconds, 2)
 
 # ---------------------------------------------------------------------------
 Write-Host ''
@@ -474,3 +661,15 @@ if (Ask-YesNo 'Create a desktop shortcut?') {
     $shortcut.Save()
     Good 'Shortcut created on your desktop.'
 }
+
+# ---------------------------------------------------------------------------
+$totalElapsed = [math]::Round($script:TotalWatch.Elapsed.TotalSeconds, 2)
+Write-Host ''
+Write-Host '------------------------------------------------------------' -ForegroundColor DarkCyan
+Write-Host "   BUILD PERFORMANCE REPORT (Total: ${totalElapsed}s)" -ForegroundColor DarkCyan
+Write-Host '------------------------------------------------------------' -ForegroundColor DarkCyan
+foreach ($entry in $script:StageTimings.GetEnumerator()) {
+    Write-Host ("   {0,-42} : {1,8} s" -f $entry.Key, $entry.Value) -ForegroundColor Gray
+}
+Write-Host '------------------------------------------------------------' -ForegroundColor DarkCyan
+

@@ -12,6 +12,10 @@
 constexpr uint32_t RBREW_ACT_SLOT_COUNT = 12;
 constexpr uint8_t RBREW_ACT_SLOT_CURRENT = 0xFE;
 constexpr uint32_t RBREW_ACT_RESULT_ACCOUNT_DOES_NOT_EXIST = 0xA071F480u;
+// Failure result for NEX token requests on the offline account. Same ACT
+// module/level as above; the description value is the port's choice, Gambit
+// (02B32E5C) only tests the sign bit.
+constexpr uint32_t RBREW_ACT_RESULT_NEX_UNAVAILABLE = 0xA071F500u;
 constexpr uint32_t RBREW_ACT_MII_NAME_MAX = 10;
 
 using RbrewFflStoreData = std::array<uint8_t, 0x60>;

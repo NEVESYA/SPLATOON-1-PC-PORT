@@ -1,4 +1,5 @@
 #include "runtime/rbrew_diagnostics.h"
+#include "runtime/benchmark_input.h"
 // Gambit PC Port — main entry point
 //
 // Boot sequence:
@@ -11,6 +12,7 @@
 
 #include "runtime/rebrewu_runtime.h"
 #include "runtime/host_process.h"
+#include "runtime/discord_rpc.h"
 #include "os/erreula/erreula.h"
 #include "os/coreinit/coreinit_overlay.h"
 #include "os/coreinit/coreinit_system_settings.h"
@@ -158,19 +160,24 @@ static unsigned profile_unwind(CONTEXT walk, uintptr_t exe, uintptr_t exe_end, u
     return found;
 }
 static void start_profiler() {
-    const char* value = rbrew_diagnostic_env("RBREW_PROFILE");
+    // Sampling must work on the normal release too: enabling every per-draw
+    // diagnostic changes the workload being investigated. No thread or timer
+    // is created unless the user explicitly requests this profile.
+    const char* value = std::getenv("RBREW_PROFILE");
     if (!value || !*value) return;
     char* end = nullptr;
     const unsigned start = unsigned(strtoul(value, &end, 10));
     const unsigned seconds = end && *end == ':' ? unsigned(strtoul(end + 1, &end, 10)) : 10u;
     const std::string path = end && *end == ':' ? std::string(end + 1) : std::string("profile.txt");
-    const char* trigger_value = rbrew_diagnostic_env("RBREW_PROFILE_TRIGGER");
+    const char* trigger_value = std::getenv("RBREW_PROFILE_TRIGGER");
     const std::string trigger = trigger_value ? trigger_value : "";
     std::thread([start, seconds, path, trigger] {
         if (!trigger.empty())
             while (GetFileAttributesA(trigger.c_str()) == INVALID_FILE_ATTRIBUTES) Sleep(250);
         RBREW_LOGF(stderr, "[profile] sampling %u s -> %s\n", seconds, path.c_str());
         Sleep(start * 1000);
+        rbrew_benchmark::profiling.store(true, std::memory_order_relaxed);
+        const uint32_t first_frame = rbrew_benchmark::frame.load(std::memory_order_relaxed);
         const auto exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
         MODULEINFO info{};
         GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(nullptr), &info, sizeof(info));
@@ -243,10 +250,12 @@ static void start_profiler() {
         if (timer) CloseHandle(timer);
         if (FILE* f = fopen(path.c_str(), "w")) {
             std::fprintf(f, "# rounds %u seconds %u\n", rounds, seconds);
+            std::fprintf(f, "# frames %u %u\n", first_frame, rbrew_benchmark::frame.load(std::memory_order_relaxed));
             for (const auto& [key, n] : hits) std::fprintf(f, "%lu %u %s\n", key.first, n, key.second.c_str());
             fclose(f);
         } else RBREW_LOGF(stderr, "[profile] cannot write %s\n", path.c_str());
         RBREW_LOGF(stderr, "[profile] finished %u rounds\n", rounds);
+        rbrew_benchmark::profiling.store(false, std::memory_order_relaxed);
     }).detach();
 }
 #else
@@ -376,6 +385,7 @@ int main(int argc, char** argv) {
     std::filesystem::current_path(std::filesystem::path(executable).parent_path(), directory_error);
     if (directory_error) return 1;
 #endif
+    rbrew::discord_rpc_init();
     RBREW_LOGF(stderr, "[BOOT] Splatoon launch runtime; RPX header entry=0x%08X\n", rebrewu_generated::Gambit_entry_point);
     RBREW_LOGF(stderr, "[FS] RBREW_CONTENT_DIR=%s\n",
         getenv("RBREW_CONTENT_DIR") ? getenv("RBREW_CONTENT_DIR") : "./content");
@@ -681,6 +691,7 @@ int main(int argc, char** argv) {
 
     // Arena and dispatch are process-owned: guest workers may still reference
     // them until process termination. Do not free them underneath live workers.
+    rbrew::discord_rpc_shutdown();
     return result;
 }
 

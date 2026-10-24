@@ -26,7 +26,10 @@
 #include "../os_common.h"
 #include "../../runtime/screen_mode.h"
 #include "../../runtime/native_control_defaults.h"
+#include "../../runtime/benchmark_input.h"
+#include "game_controllers.h"
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <mutex>
@@ -92,11 +95,16 @@ static constexpr uint32_t kVpadBattery = 0xA1, kVpadSlideVolume = 0xA0, kVpadSli
 static constexpr float KBM_MOUSE_SENSITIVITY = 0.005f;
 
 // Keep the tutorial's working virtual-motion camera, driven by right stick
-// or mouse. The active scene lookup switches to motion off / sensitivity 0
-// outside the tutorial, including Plaza. Saved preferences stay off / 0;
-// no progression or tutorial-completion flags are changed.
+// or mouse. Outside the tutorial, including Plaza, the active options follow
+// the save: sensitivity 0 (neutral) and the player's own motion setting.
+// No progression or tutorial-completion flags are changed.
 void vpad_apply_motion_policy(uint8_t* mem) {
-    rbrew_control_defaults::apply_live(mem);
+    static auto s_last_policy = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    auto now = std::chrono::steady_clock::now();
+    if (now - s_last_policy > std::chrono::milliseconds(100)) {
+        s_last_policy = now;
+        rbrew_control_defaults::apply_live(mem);
+    }
 }
 
 // Write a VPADTouchData entry (8 bytes, big-endian u16 fields) at 'base'.
@@ -118,14 +126,7 @@ static constexpr float kTpOffsetX = 92.0f, kTpOffsetY = 254.0f, kTpRangeX = 3883
 uint16_t vpad_touch_raw_x(uint16_t screen_x) { return uint16_t(std::lround(screen_x * kTpRangeX / 854.0f + kTpOffsetX)); }
 uint16_t vpad_touch_raw_y(uint16_t screen_y) { return uint16_t(std::lround(4095.0f - kTpOffsetY - screen_y * kTpRangeY / 480.0f)); }
 
-// Radial deadzone with rescale; result clamped to the unit circle.
-static void shape_stick(float& x, float& y) {
-    constexpr float kDeadzone = 0.10f;
-    const float length = std::sqrt(x * x + y * y);
-    if (length <= kDeadzone) { x = y = 0.0f; return; }
-    const float scaled = std::fmin(1.0f, (length - kDeadzone) / (1.0f - kDeadzone));
-    x = x / length * scaled; y = y / length * scaled;
-}
+// shape_stick defined inline in game_controllers.h
 static uint32_t stick_emulation(float x, float y, uint32_t left, uint32_t right, uint32_t up, uint32_t down) {
     constexpr float kThreshold = 0.5f;
     uint32_t bits = 0;
@@ -172,13 +173,40 @@ static VirtualMotion s_motion;
 static constexpr float kPi = 3.14159265358979f;
 static constexpr float kYawRate = 240.0f, kPitchRate = 150.0f, kPitchLimit = 80.0f;  // degrees(/s)
 
-// Advances the virtual GamePad by dt seconds of right-stick input and writes
-// acc/gyro/angle/direction into the VPADStatus at buf.
-void vpad_update_motion(uint8_t* mem, uint32_t buf, float rx, float ry, float dt) {
+// RBREW_GYRO=0 ignores a controller's gyro sensor (stick/mouse only).
+static bool physical_gyro_enabled() {
+    static const bool enabled = [] { const char* v = std::getenv("RBREW_GYRO"); return !(v && v[0] == '0'); }();
+    return enabled;
+}
+
+// Advances the virtual GamePad by dt seconds and writes acc/gyro/angle/
+// direction into the VPADStatus at buf. The right stick/mouse always turns
+// it; a controller gyro (SDL, rad/s: x = pitch, y = yaw) adds its rotation.
+// Previously any gyro reading replaced the stick entirely, so with a
+// DualShock/DualSense the tutorial camera ignored the right stick and the
+// reported acceleration no longer matched the reported orientation.
+void vpad_update_motion(uint8_t* mem, uint32_t buf, float rx, float ry, float dt,
+                        const float* phys_gyro = nullptr, const float* /*phys_accel*/ = nullptr) {
     std::lock_guard lock(s_motion_lock);
     VirtualMotion& v = s_motion;
-    // Squared response keeps small deflections precise.
-    const float yaw_rate = -rx * std::fabs(rx) * kYawRate, pitch_rate = -ry * std::fabs(ry) * kPitchRate;
+    // Squared response keeps small deflections precise. The game already turns
+    // the camera with stick X itself; also yawing the virtual pad turned it
+    // twice as fast with motion controls on. Stick Y stays: with motion
+    // controls the game ignores stick Y and pitches only by the pad.
+    // RBREW_STICK_GYRO_YAW=1 restores the stick-driven yaw.
+    static const bool stick_yaw = [] { const char* v = std::getenv("RBREW_STICK_GYRO_YAW"); return v && v[0] == '1'; }();
+    float yaw_rate = stick_yaw ? -rx * std::fabs(rx) * kYawRate : 0.0f, pitch_rate = -ry * std::fabs(ry) * kPitchRate;
+    if (phys_gyro && physical_gyro_enabled()) {
+        constexpr float kGyroDeadzone = 0.02f;   // rad/s: resting sensor noise/drift
+        auto rate = [&](float radians) { return std::fabs(radians) < kGyroDeadzone ? 0.0f : radians * (180.0f / kPi); };
+        // SDL: +x tilts the far edge up (aim up), which is negative pitch
+        // here; +y turns left, which is positive yaw. Adding +x inverted
+        // vertical aiming. RBREW_GYRO_INVERT_PITCH=1 / _YAW=1 flip an axis.
+        static const bool invert_pitch = [] { const char* v = std::getenv("RBREW_GYRO_INVERT_PITCH"); return v && v[0] == '1'; }();
+        static const bool invert_yaw = [] { const char* v = std::getenv("RBREW_GYRO_INVERT_YAW"); return v && v[0] == '1'; }();
+        pitch_rate += invert_pitch ? rate(phys_gyro[0]) : -rate(phys_gyro[0]);
+        yaw_rate += invert_yaw ? -rate(phys_gyro[1]) : rate(phys_gyro[1]);
+    }
     v.yaw = std::fmod(v.yaw + yaw_rate * dt, 360.0f);
     const float pitch = std::fmax(-kPitchLimit, std::fmin(kPitchLimit, v.pitch + pitch_rate * dt));
     const float applied_pitch_rate = dt > 0 ? (pitch - v.pitch) / dt : 0.0f;
@@ -232,23 +260,7 @@ uint32_t vpad_update_edges(uint32_t hold, uint32_t& trigger, uint32_t& release) 
     return previous;
 }
 
-#if defined(HAVE_SDL2)
-static SDL_GameController* open_controller() {
-    static SDL_GameController* s_gc = nullptr;
-    if (s_gc && SDL_GameControllerGetAttached(s_gc)) return s_gc;
-    if (s_gc) { SDL_GameControllerClose(s_gc); s_gc = nullptr; }
-    for (int i = 0; i < SDL_NumJoysticks(); ++i) {
-        if (!SDL_IsGameController(i) || !(s_gc = SDL_GameControllerOpen(i))) continue;
-        char* mapping = SDL_GameControllerMapping(s_gc);
-        RBREW_LOGF(stderr, "[vpad] using controller '%s' type=%d vid=%04X pid=%04X mapping=%s\n",
-                SDL_GameControllerName(s_gc), int(SDL_GameControllerGetType(s_gc)),
-                SDL_GameControllerGetVendor(s_gc), SDL_GameControllerGetProduct(s_gc), mapping ? mapping : "-");
-        SDL_free(mapping);
-        break;
-    }
-    return s_gc;
-}
-#endif
+// Controller acquisition is handled through get_controller(0) for Player 1
 
 // ---------------------------------------------------------------------------
 // VPADRead(chan, buffers, count, error) → samplesRead
@@ -274,8 +286,24 @@ static void VPADRead(CPUState* cpu) {
     float lx = 0.0f, ly = 0.0f; // left stick (movement), y > 0 = up
     float rx = 0.0f, ry = 0.0f; // right stick (camera)
 
+    float phys_gyro[3] = {};
+    float phys_accel[3] = {};
+    bool has_phys_gyro = false, has_phys_accel = false;
+
 #if defined(HAVE_SDL2)
-    if (SDL_GameController* gc = open_controller()) {
+    ControllerDevice* dev = get_controller(0); // Player 1 (GamePad)
+    if (dev && dev->gc) {
+        SDL_GameController* gc = dev->gc;
+        if (dev->has_gyro) {
+            if (SDL_GameControllerGetSensorData(gc, SDL_SENSOR_GYRO, phys_gyro, 3) == 0) {
+                has_phys_gyro = true;
+            }
+        }
+        if (dev->has_accel) {
+            if (SDL_GameControllerGetSensorData(gc, SDL_SENSOR_ACCEL, phys_accel, 3) == 0) {
+                has_phys_accel = true;
+            }
+        }
         auto btn = [&](SDL_GameControllerButton b) {
             return SDL_GameControllerGetButton(gc, b) != 0;
         };
@@ -298,8 +326,8 @@ static void VPADRead(CPUState* cpu) {
         if (btn(SDL_CONTROLLER_BUTTON_RIGHTSTICK))    buttons |= VPAD_BUTTON_STICK_R;
 
         // Left trigger → ZL, right trigger → ZR (digital triggers report 32767)
-        if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT)  > 16384) buttons |= VPAD_BUTTON_ZL;
-        if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 16384) buttons |= VPAD_BUTTON_ZR;
+        if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT)  > 8000) buttons |= VPAD_BUTTON_ZL;
+        if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 8000) buttons |= VPAD_BUTTON_ZR;
 
         // SDL axes: [-32768, 32767] with y > 0 = down; the GamePad reports y > 0 = up.
         lx =  SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX)  / 32767.0f;
@@ -345,6 +373,7 @@ static void VPADRead(CPUState* cpu) {
         if (mstate & SDL_BUTTON(SDL_BUTTON_RIGHT)) buttons |= VPAD_BUTTON_ZL;
 
         // Keyboard buttons
+        if (keys[SDL_SCANCODE_RETURN]) buttons |= VPAD_BUTTON_A;
         if (keys[SDL_SCANCODE_SPACE])  buttons |= VPAD_BUTTON_B;   // jump
         if (keys[SDL_SCANCODE_Q])      buttons |= VPAD_BUTTON_X;   // sub weapon
         if (keys[SDL_SCANCODE_E])      buttons |= VPAD_BUTTON_Y;   // special weapon
@@ -354,11 +383,88 @@ static void VPADRead(CPUState* cpu) {
         if (keys[SDL_SCANCODE_ESCAPE]) buttons |= VPAD_BUTTON_HOME;  // home menu
     }
 
+    static const bool s_auto_input = (std::getenv("RBREW_AUTO_INPUT") != nullptr);
+    bool auto_touched = false;
+    uint16_t auto_tx = 0, auto_ty = 0;
+    if (s_auto_input) {
+        static uint32_t s_auto_frame = 0;
+        ++s_auto_frame;
+        // Stage 1 (0..300): Title screen - press ZL + ZR
+        if (s_auto_frame < 300) {
+            if ((s_auto_frame % 30) < 15) {
+                buttons |= (VPAD_BUTTON_ZR | VPAD_BUTTON_ZL);
+            }
+        }
+        // Stage 2 (300..600): "Choose one!" - highlight Girl and select
+        else if (s_auto_frame < 600) {
+            if ((s_auto_frame % 40) < 15) {
+                buttons |= VPAD_BUTTON_LEFT | VPAD_STICK_L_EMULATION_LEFT;
+                lx = -1.0f;
+            } else if ((s_auto_frame % 40) >= 20 && (s_auto_frame % 40) < 35) {
+                buttons |= VPAD_BUTTON_A;
+            }
+        }
+        // Stage 3 (600..900): Character customization - press PLUS / START to proceed
+        else if (s_auto_frame < 900) {
+            if ((s_auto_frame % 40) < 15) {
+                buttons |= VPAD_BUTTON_PLUS;
+            } else if ((s_auto_frame % 40) >= 20 && (s_auto_frame % 40) < 35) {
+                buttons |= VPAD_BUTTON_A;
+            }
+        }
+        // Stage 4 (900..1300): Confirmation dialog "Happy with this look?" - select Yes and confirm
+        else if (s_auto_frame < 1300) {
+            if ((s_auto_frame % 40) < 15) {
+                buttons |= VPAD_BUTTON_LEFT | VPAD_STICK_L_EMULATION_LEFT;
+                lx = -1.0f;
+            } else if ((s_auto_frame % 40) >= 20 && (s_auto_frame % 40) < 35) {
+                buttons |= VPAD_BUTTON_A;
+            }
+        }
+        // Stage 5 (1300+): Tutorial active gameplay (moving, shooting ink, camera rotation, squid swim)
+        else {
+            ly = 1.0f; // Walk forward
+            rx = std::sin(float(s_auto_frame) * 0.05f) * 0.8f; // Aim / camera pan
+            ry = std::cos(float(s_auto_frame) * 0.03f) * 0.3f; // Pitch
+            
+            uint32_t act = (s_auto_frame / 90) % 4;
+            if (act == 0) {
+                buttons |= VPAD_BUTTON_ZR; // Continuous ink shooting
+            } else if (act == 1) {
+                buttons |= VPAD_BUTTON_ZL; // Move through ink in squid form
+            } else if (act == 2) {
+                buttons |= VPAD_BUTTON_B | VPAD_BUTTON_ZR; // Jump and shoot
+            } else {
+                buttons |= VPAD_BUTTON_R;  // Throw sub-weapon
+            }
+        }
+    }
+
+    rbrew_benchmark::Input scripted;
+    if (rbrew_benchmark::scripted_input(scripted)) {
+        buttons = scripted.buttons;
+        lx = scripted.lx; ly = scripted.ly; rx = scripted.rx; ry = scripted.ry;
+        has_phys_gyro = has_phys_accel = false;
+        auto_touched = scripted.touched != 0;
+        auto_tx = vpad_touch_raw_x(uint16_t(scripted.x));
+        auto_ty = vpad_touch_raw_y(uint16_t(scripted.y));
+        static const bool actions = std::getenv("RBREW_BENCHMARK_ACTIONS") != nullptr;
+        if (actions && rbrew_control_defaults::active_scene_type(MEM) == 6) {
+            static const uint32_t first = rbrew_benchmark::frame.load();
+            const uint32_t age = rbrew_benchmark::frame.load() - first;
+            // Same motion/fire path in every candidate, keyed to game frames.
+            lx = 0; ly = 0.6f; rx = 0.35f * std::sin(float(age) * 0.01f); ry = 0.12f * std::sin(float(age) * 0.007f);
+            buttons = (age / 120) % 3 == 1 ? VPAD_BUTTON_ZL : VPAD_BUTTON_ZR;
+            if ((age / 60) % 4 == 3) buttons |= VPAD_BUTTON_B;
+            auto_touched = false;
+        }
+    }
+
     // --- Simulated touch from mouse in Gamepad View ---
     {
-        const bool touched = g_touch_state.touched;
-        const uint16_t tx = touched ? vpad_touch_raw_x(g_touch_state.x) : 0;
-        const uint16_t ty = touched ? vpad_touch_raw_y(g_touch_state.y) : 0;
+        const bool touched = g_touch_state.touched || auto_touched;
+        const uint16_t tx = touched ? (auto_touched ? auto_tx : vpad_touch_raw_x(g_touch_state.x)) : 0;
+        const uint16_t ty = touched ? (auto_touched ? auto_ty : vpad_touch_raw_y(g_touch_state.y)) : 0;
         const uint16_t validity = touched ? VPAD_TP_VALID : VPAD_TP_INVALID_XY;
         write_touch_data(MEM, buf + kVpadTpNormal, tx, ty, touched, validity);
         write_touch_data(MEM, buf + kVpadTpFiltered1, tx, ty, touched, validity);
@@ -379,7 +485,7 @@ static void VPADRead(CPUState* cpu) {
     write_float(MEM, buf + 0x14, rx);
     write_float(MEM, buf + 0x18, ry);
 
-    vpad_update_motion(MEM, buf, rx, ry, motion_seconds());
+    vpad_update_motion(MEM, buf, rx, ry, motion_seconds(), has_phys_gyro ? phys_gyro : nullptr, has_phys_accel ? phys_accel : nullptr);
     rbrew_write8(MEM, buf + kVpadSlideVolume, 0xFF);
     rbrew_write8(MEM, buf + kVpadSlideVolumeEx, 0xFF);
     rbrew_write8(MEM, buf + kVpadBattery, 0xC0); // full
@@ -389,6 +495,8 @@ static void VPADRead(CPUState* cpu) {
     rbrew_write32(MEM, buf + 0x00, buttons);
     rbrew_write32(MEM, buf + 0x04, trigger);
     rbrew_write32(MEM, buf + 0x08, release);
+
+    log_controller_input(0, buttons, lx, ly, rx, ry, has_phys_gyro, phys_gyro);
 
     RET = 1; // 1 sample read
 }

@@ -68,9 +68,9 @@ static void ACTGetDefaultAccount(CPUState* cpu)  { RET = 1; }
 static void ACTGetMii(CPUState* cpu)             { RET = (uint32_t)-1; }
 static void ACTGetAccountId(CPUState* cpu) {
     // Write a dummy account ID string
-    if (ARG0) {
+    if (ARG0 && rbrew_memory_accessible(MEM, ARG0, 16)) {
         static const char id[] = "GambitPortUser";
-        for (size_t i = 0; i <= sizeof(id); ++i)
+        for (size_t i = 0; i < sizeof(id); ++i)
             rbrew_write8(MEM, ARG0 + (uint32_t)i, (uint8_t)id[i]);
     }
     RET = 0;
@@ -319,15 +319,13 @@ void stubs_register(CPUState* cpu) {
     // REG(BOSSInit); // not in this game's PLT
     // REG(BOSSGetStorageInfo); // not in this game's PLT
     // REG(BOSSGetTaskIdList); // not in this game's PLT
-    // nn_nfp
-    // REG(NFPInit); // not in this game's PLT
-    // REG(NFPInitialize); // not in this game's PLT
-    // REG(NFPGetNfpState); // not in this game's PLT
-    // REG(NFPStartDetection); // not in this game's PLT
-    // REG(NFPStopDetection); // not in this game's PLT
-    // REG(NFPMount); // not in this game's PLT
-    // REG(NFPIsNfcEnabled); // not in this game's PLT
-    // REG(NFPFinalize); // not in this game's PLT
+    // nn_nfp (Amiibo support - stubs returning safe non-ready state)
+    rbrew_register_func(cpu, ADDR_Initialize__Q2_2nn3nfpFv, NFPInitialize);
+    rbrew_register_func(cpu, ADDR_GetNfpState__Q2_2nn3nfpFv, NFPGetNfpState);
+    rbrew_register_func(cpu, ADDR_StartDetection__Q2_2nn3nfpFv, NFPStartDetection);
+    rbrew_register_func(cpu, ADDR_StopDetection__Q2_2nn3nfpFv, NFPStopDetection);
+    rbrew_register_func(cpu, ADDR_Mount__Q2_2nn3nfpFv, NFPMount);
+    rbrew_register_func(cpu, ADDR_GetErrorCode__Q2_2nn3nfpFRCQ2_2nn6Result, NFPInit);
     // nn_fp
     // REG(FPInit); // not in this game's PLT
     // REG(FPIsInitialized); // not in this game's PLT

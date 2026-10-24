@@ -577,3 +577,143 @@ measured and reverted (layout noise exceeded any gain). The NPC render bench
 CPU translation is ~1.1 µs per draw. These are synthetic measurements, not
 game FPS. 60/60 CTest cases pass on RTX 4050; render, advanced and guest
 cases (31) pass on Intel UHD.
+
+## Game/render-thread serialization (2026-10-24)
+
+A 12-second CPU profile of the tutorial (RTX 3060 host, 49 FPS average,
+19.9 ms game-thread work per frame), symbolized with `build/game/Splatoon.map`
+(`scripts/analyze_playtest.py` does this automatically):
+
+| Thread | Share of samples | Where |
+|---|---:|---|
+| Game thread | 49% | waiting in `GX2QueryGetOcclusionResult` for the render queue to drain |
+| Game thread | 3% | `GX2DrawDone` |
+| Render thread | 13% | `flush_streamouts` waiting for the GPU (`gx2vk::finish`) before the next draw |
+| Render thread | 42% | idle (spin/sleep) |
+
+Splatoon keeps its occlusion queries in a ring and polls the oldest one each
+frame (`027E99AC`); a FALSE result simply retries next frame, as on the console
+where `GX2QueryGetOcclusionResult` reads the counter block without blocking.
+The port waited whenever that query's begin was still queued, which made the
+game thread wait for every queued draw, many times per frame.
+
+Changes:
+
+- A read whose begin is still queued now returns "not ready" immediately
+  (later reverted, see the follow-up below). If the queue is idle but the
+  renderer dropped the begin, the synchronous path still answers.
+- Stream-out results are copied back only when a later draw reads an
+  overlapping vertex, index, uniform or texture range, at `GX2Flush` /
+  `GX2DrawDone`, or when the 32-entry batch is full (`RBREW_STREAMOUT_EAGER=1`
+  restores the per-draw readback). Offsets that a newer export or a new
+  `GX2SetStreamOutContext` already replaced are not overwritten by the late
+  publication.
+
+Expected effect: the game thread's ~10 ms of own work per frame can overlap the
+render thread again. This must be confirmed with a new recording
+(`scripts\dev.bat play`, then `scripts\dev.bat analyze`).
+
+### Follow-up (2026-10-24, first recording after the fixes)
+
+Measured (tutorial, `2026-10-24_13-17-40`): 71.4 FPS average (was 49), P95
+23.8 ms, 1% low 13.6 FPS. But the tutorial prompts disappeared, ink and physics
+misbehaved, and the game ran at 90-100 FPS in menus and gameplay.
+
+- Occlusion queries: the immediate "not ready" broke UI, ink and physics (A/B:
+  correct with the old wait), so waiting became the default again. With the
+  wait the game still ran above 60 FPS. (Refined in the next section.)
+- Frame pacing: `GX2SetSwapInterval` was a stub and a swap flipped as soon as
+  it was presented, so the game, which paces on the flip counter, ran
+  unthrottled and its logic and camera sped up. A swap now flips at the first
+  vblank `interval` vblanks after the previous flip; a late frame flips at once
+  (no drop to 30 FPS). `RBREW_FRAME_PACING=0` restores the immediate flip.
+- Uniform cache (from the GitHub merge): `RBREW_UNIFORM_CACHE=0` compares guest
+  bytes on every bind instead of trusting write-watch generations, and
+  `RBREW_WRITE_WATCH_DISABLE=1` (slow) now also works in release builds, for
+  A/B tests of the write-watch caches.
+
+### Boot time, scene-change flashes, camera, overlay (2026-10-24, second recording)
+
+Measured (tutorial, `2026-10-24_13-55-07`, with the fixes above): 57.0 FPS
+average, P95 20.5 ms, 1% low 24.7 FPS, 74% of frames <= 17.5 ms; title and
+character setup a steady 59.7 FPS. 53% of the game thread still waited in
+`GX2QueryGetOcclusionResult`.
+
+- Boot loading screen ~28 s. A loading-screen profile showed every thread
+  idle; `RBREW_IMPORT_TRACE` / `RBREW_SLEEP_TRACE` (new, release builds too)
+  showed `nn::ac::Connect` succeeding while `IsApplicationConnected` said
+  offline, after which the game's NEX/Pia login (`AcquireNexServiceToken`,
+  scheduler threads polling every 10 ms) ran until its 30 s timeout
+  (`OSCancelAlarms` at 36.4 s). `Connect` now fails like a console without
+  internet and `AcquireNexServiceToken` fails for the offline account: the
+  character setup appears ~5 s after the first frame instead of ~33 s.
+  `RBREW_AC_CONNECT=ok` / `RBREW_NEX_TOKEN=stub` restore the old results.
+- Black flashes on scene changes: the presented "scan buffer" was the game's
+  colour buffer itself, so a frame without a new scan copy showed whatever the
+  game was clearing/drawing. The scan copy is now a real copy, as on the
+  console (`RBREW_SCAN_COPY=0` restores the reference).
+- Camera too fast horizontally: the right stick turned the camera through the
+  game and again by yawing the virtual GamePad. Stick X no longer yaws the
+  virtual pad (`RBREW_STICK_GYRO_YAW=1` restores it); stick Y still pitches it.
+- Occlusion queries, refined: Gambit's only caller (`027E99AC`) polls a ring
+  and retries FALSE next frame. The first attempt also answered "not ready" for
+  queries that were ever begun from a display list (sticky `listed` flag, no
+  issue count) whenever the queue was busy, which stalled the ring. Now only
+  immediate begins answer "not ready"; listed ones still wait.
+  `RBREW_QUERY_ASYNC=0` waits for all, `=1` is the broken first attempt.
+- FPS overlay: an anti-aliased system-font panel (FPS in traffic-light colours,
+  frame time, 1% low, max, frame-time graph with a 16.7 ms line) replaces the
+  5x7 text line (`RBREW_FPS_OVERLAY_STYLE=classic`).
+
+To be confirmed with the next recording.
+
+### Button labels, GamePad screen, stream-out (2026-10-24, third recording)
+
+Measured (`2026-10-24_14-31-38`): title/character setup 59.0 FPS (only 579
+frames: the boot fix works), tutorial 55.3 FPS (P95 22.1 ms, 60% <= 17.5 ms),
+first plaza scene 34.9 FPS. Tutorial prompts, ink and physics were correct
+with the refined query mode, but 50% of the game thread still waited for
+occlusion queries: nearly all of Gambit's queries are begun from display
+lists, and the render thread spent 22% publishing stream-out data on each
+`GX2Flush` (a GPU wait the query reads then waited for).
+
+- Missing "Girl"/"Boy"/"Yeah!"/"Hold on!" on the character-setup splats
+  (`Plm_CharacterBtn_00`): the game renders the label into a 250x150 RGBA8
+  capture, encodes it to BC5 on the GPU (63x38 R32G32B32A32 target over the
+  texture's memory) and samples that. The text pass blends alpha with
+  COMB_FCN 3 (MAX); the port mapped GX2 blend combine 2/3/4 to
+  reverse-subtract/MIN/MAX instead of MIN/MAX/reverse-subtract, so alpha
+  stayed 0 and the encoder produced empty blocks. Fixed for every blend
+  (`RBREW_BLEND_COMBINE_OLD=1`). Also: the block copy into a non-multiple-of-4
+  BC texture now goes through a buffer (an image copy of whole blocks overran
+  the image; `RBREW_BLOCK_COPY_DIRECT=1`), and CB_BLEND0_CONTROL /
+  CB_COLOR_CONTROL written by display lists are applied (`RBREW_DL_BLEND=0`).
+- GamePad (DRC) screen never reached the scan buffer: the game passes its DRC
+  buffer with viewNumSlices 0 but renders it with 1, so the exact lookup always
+  missed (`[scan] missing source target=4`). 0 and 1 slices now match
+  (`RBREW_SCAN_SLICE_MATCH=0`). This affects the GamePad view (TAB), the map
+  and GamePad pictures.
+- `GX2Flush` no longer publishes pending stream-out results; draws that read
+  them and `GX2DrawDone` still do (`RBREW_STREAMOUT_FLUSH_PUBLISH=1`).
+- The black screen with the swimming squid after character setup is the game's
+  own loading screen (~4 s).
+
+### Plaza pacing, tutorial transition, audio filters (2026-10-24, fourth recording)
+
+Measured (`2026-10-24_17-22-39`): character setup 59.5 FPS; tutorial 58.7 FPS
+(P95 18.5 ms, 91% <= 17.5 ms; was 55.3 / 60%); plaza (scene 2) 35.7 FPS with
+P50 26.1 ms, P95 40.8 ms. Occlusion-query waits fell to 28% of the game thread.
+
+- Plaza: the console runs it at 30 FPS because a frame that misses a vblank
+  flips at the next one. The first pacing flipped late frames at once, so
+  ~26 ms frames alternated 26/33 ms (35.7 FPS average, uneven). Flips are now
+  vblank-quantized like the console's (`RBREW_FRAME_PACING=adaptive` restores
+  the first version). Gambit sets the swap interval only at boot (02818190).
+- Tutorial entry: the user's video (previous build) showed ~4 frames of the
+  half-loaded stage before the squid wipe; the black cover is a MIN blend,
+  which the old blend-combine mapping ran as dst-src (fixed above).
+- Audio: `AXSetVoiceLpf`/`LpfCoefs`/`Biquad`/`BiquadCoefs`/`AXComputeLpfCoefs`
+  were STUBs; voice filters are now applied after sample-rate conversion
+  (biquad drops itself if it turns unstable). `RBREW_AX_FILTERS=0` ignores them.
+- The playtest CPU profile is now taken in the plaza (scene 2) after a minute,
+  else in scenes 3/5/6 after three minutes.

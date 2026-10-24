@@ -24,3 +24,22 @@ save/
 __pycache__/
 *.pyc
 .vs/
+
+# Local developer artifacts: screenshots, frame dumps, logs and backups made
+# while testing. They stay on disk but are never committed.
+/backups/
+/frame_dumps*/
+/gameplay_dumps/
+/validation_results/
+/tools/
+/*.png
+/*.log
+/link_cmd.txt
+/user_prompt_full.txt
+/original_cpp_emitter.cpp
+/check_parts.py
+
+# scripts/: only the maintained tools are tracked. One-off experiment scripts
+# can live here without showing up in git status. Add new tools below.
+/scripts/*
+!/scripts/Setup.ps1
