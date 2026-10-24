@@ -61,7 +61,7 @@ Keyboard and mouse:
 | F | Map (+) |
 | G | Options (−) |
 | Esc | Home |
-| Tab | GamePad view (the mouse becomes the touch screen) |
+| Tab | GamePad view (the mouse becomes the touch screen) NOT WORKING YET|
 | F3 | Show/hide the FPS overlay (translucent panel: FPS, frame time, 1% low, slowest frame, frame-time graph) and frame stats in the window title |
 | F4 | Detailed frame stats in the window title (1% low, P95/P99, RAM) |
 | F8 / F9 | Start/stop an extended diagnostic recording / save a diagnostic snapshot to `Game\Diagnostics` |
